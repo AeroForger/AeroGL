@@ -1,5 +1,4 @@
 use minifb::{Key, Window, WindowOptions};
-
 //sorry for swearing
 
 const WIDTH: usize = 800;
@@ -39,13 +38,6 @@ fn set_pixel(buffer: &mut [u32], x: i32, y: i32, color: u32) {
     buffer[y as usize * WIDTH + x as usize] = color;
 }
 
-fn ast(){
-    //will build the mesh from inputs
-    // app flow:
-    // cli -> this shit -> window init -> calculations -> drawing -> resetting
-}
-
-
 fn init_window() -> Window {
     let mut window = Window::new(
         "AeroGl",
@@ -60,26 +52,59 @@ fn init_window() -> Window {
     window 
 }
 
-fn draw_triangle(){
+fn draw_rect(buffer: &mut [u32], x0: i32, x1: i32, y0: i32, y1: i32, color: u32) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            set_pixel(buffer, x, y, color);
+        }
+    }
+}
+fn draw_line_float(buffer: &mut [u32], x0: f32, y0: f32, x1: f32, y1: f32, color: u32) {
+    let dx = x1 - x0; 
+    let dy = y1 - y0; 
 
+    let steps = dx.abs().max(dy.abs()).round() as i32; 
+
+    if steps == 0 {
+        set_pixel(buffer, x0.round() as i32, y0.round() as i32, color); 
+        return;
+    }
+
+    let x_inc = dx / steps as f32; 
+    let y_inc = dy / steps as f32; 
+
+    let mut x = x0; 
+    let mut y = y0; 
+
+    for _ in 0..=steps {
+        set_pixel(buffer, x.round() as i32, y.round() as i32, color);
+        x += x_inc;
+        y += y_inc;
+    }
+}
+fn draw_line(buffer: &mut [u32], x: &mut f32, y: &mut f32, heading: f32, len: f32, color: u32) {
+    let nx = *x + heading.cos() * len;
+    let ny = *y + heading.sin() * len;
+    draw_line_float(buffer, *x, *y, nx, ny, color);
+    *x = nx;
+    *y = ny;
 }
 
 fn main() {
     let mut window = init_window();
-
     let mut color_buffer = vec![0u32; WIDTH * HEIGHT];
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {        // Same result as the loop, clearer and usually just as fast.
+    while window.is_open() && !window.is_key_down(Key::Escape) {        
         color_buffer.fill(0x001A2B3C);
 
-        for y in 200..600 {
-            for x in 300..500 {
-                set_pixel(&mut color_buffer, x, y, 0x00FF0000);
-            }
-        }
+            
+        draw_rect(&mut color_buffer, 200, 600, 200, 600, 0x00FF0000);
+
 
         window
             .update_with_buffer(&color_buffer, WIDTH, HEIGHT)
             .unwrap();
+        
+
     }
 }
