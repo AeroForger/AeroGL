@@ -31,6 +31,11 @@ impl FragmentShader for FlatShader {
     }
 }//ok
 
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    //da larp formula that gives 0-1.0
+    a + (b-a) * t
+}
+
 fn set_pixel(buffer: &mut [u32], x: i32, y: i32, color: u32) {
     if x < 0 || y < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 {
         return;
@@ -82,7 +87,7 @@ fn draw_line_float(buffer: &mut [u32], x0: f32, y0: f32, x1: f32, y1: f32, color
         y += y_inc;
     }
 }
-fn draw_line(buffer: &mut [u32], x: &mut f32, y: &mut f32, heading: f32, len: f32, color: u32) {
+fn turtle_move(buffer: &mut [u32], x: &mut f32, y: &mut f32, heading: f32, len: f32, color: u32) {
     let nx = *x + heading.cos() * len;
     let ny = *y + heading.sin() * len;
     draw_line_float(buffer, *x, *y, nx, ny, color);
@@ -96,7 +101,11 @@ fn main() {
 
     while window.is_open() && !window.is_key_down(Key::Escape) {        
         color_buffer.fill(0x001A2B3C);
+        let mut tx = 400.0;
+        let mut ty = 400.0;
 
+        // inside the loop:
+        turtle_move(&mut color_buffer, &mut tx, &mut ty, 0.0, 200.0, 0x00FFFFFF);
             
         draw_rect(&mut color_buffer, 200, 600, 200, 600, 0x00FF0000);
 
