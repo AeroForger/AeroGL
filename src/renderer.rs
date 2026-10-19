@@ -1,7 +1,7 @@
 //! The reusable renderer: owns buffers, applies the AA strategy, returns pixels.
 //! Made by AeroForger
 
-use crate::aa::{AntiAliasing, apply_smaa, resolve_downsample};
+use crate::aa::{AntiAliasing, SmaaScratch, apply_smaa_with_scratch, resolve_downsample};
 use crate::camera::Camera;
 use crate::framebuffer::Framebuffer;
 use crate::pipeline::{ShadowMask, render_scene};
@@ -46,8 +46,9 @@ pub struct Renderer {
     /// Frame options; change these at any time.
     pub options: RenderOptions,
     internal: Framebuffer,
-    output: Vec<u32>,
+    output: Framebuffer,
     shadow: ShadowMask,
+    smaa: SmaaScratch,
 }
 
 impl Renderer {
@@ -59,8 +60,9 @@ impl Renderer {
             height,
             options: RenderOptions::default(),
             internal: Framebuffer::new(width, height),
-            output: vec![0; width * height],
+            output: Framebuffer::new(width, height),
             shadow: ShadowMask::new(),
+            smaa: SmaaScratch::new(),
         }
     }
 
@@ -79,7 +81,7 @@ impl Renderer {
         assert!(width > 0 && height > 0);
         self.width = width;
         self.height = height;
-        self.output.resize(width * height, 0);
+        self.output.resize(width, height);
     }
 
     /// Renders one frame and returns the packed `0x00RRGGBB` pixels.
@@ -87,33 +89,47 @@ impl Renderer {
     /// The slice is valid until the next [`Renderer::render`] call.
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> &[u32] {
         let scale = self.options.aa.scale() as usize;
-        let (iw, ih) = (self.width * scale, self.height * scale);
+        if scale == 1 {
+            // No supersampling: render directly into the output framebuffer.
+            // This avoids copying the whole image through `internal` first.
+            self.output.resize(self.width, self.height);
+            self.output.clear(self.options.background);
+            {
+                let mut target = self.output.target();
+                render_scene(&mut target, scene, camera, &mut self.shadow);
+            }
+            if self.options.aa == AntiAliasing::Smaa {
+                apply_smaa_with_scratch(
+                    &mut self.output.color,
+                    self.width,
+                    self.height,
+                    &mut self.smaa,
+                );
+            }
+        } else {
+            let (iw, ih) = (self.width * scale, self.height * scale);
+            self.internal.resize(iw, ih);
+            self.internal.clear(self.options.background);
+            {
+                let mut target = self.internal.target();
+                render_scene(&mut target, scene, camera, &mut self.shadow);
+            }
 
-        self.internal.resize(iw, ih);
-        self.internal.clear(self.options.background);
-
-        {
-            let mut target = self.internal.target();
-            render_scene(&mut target, scene, camera, &mut self.shadow);
+            self.output.resize(self.width, self.height);
+            resolve_downsample(
+                &self.internal.color,
+                &mut self.output.color,
+                self.width,
+                self.height,
+                scale,
+            );
         }
-
-        self.output.resize(self.width * self.height, 0);
-        resolve_downsample(
-            &self.internal.color,
-            &mut self.output,
-            self.width,
-            self.height,
-            scale,
-        );
-        if self.options.aa == AntiAliasing::Smaa {
-            apply_smaa(&mut self.output, self.width, self.height);
-        }
-        &self.output
+        &self.output.color
     }
 
     /// The last rendered pixels.
     pub fn pixels(&self) -> &[u32] {
-        &self.output
+        &self.output.color
     }
 }
 

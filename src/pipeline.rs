@@ -4,7 +4,8 @@
 //! Made by AeroForger
 
 use crate::camera::Camera;
-use crate::draw::{ShadedVertex, draw_line_z, draw_triangle_gouraud, draw_triangle_z, lerp, rgb};
+use crate::draw::triangle::draw_triangle_cover;
+use crate::draw::{ShadedVertex, draw_line_z, draw_triangle_gouraud, lerp, rgb};
 use crate::framebuffer::Target;
 use crate::light::DirectionalLight;
 use crate::material::Material;
@@ -317,14 +318,22 @@ pub struct ShadowMask {
     height: usize,
     /// Non-zero where a shadow triangle covered the pixel.
     mask: Vec<u32>,
-    /// Depth of the shadow geometry (NDC, smaller is closer).
-    depth: Vec<f32>,
+    /// Bounding box of pixels touched this frame, so compositing can skip the
+    /// rest of the image.
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
 }
 
 impl ShadowMask {
     /// An empty mask; it sizes itself on first use.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            min_x: usize::MAX,
+            min_y: usize::MAX,
+            ..Self::default()
+        }
     }
 
     /// Resizes (if needed) and clears the mask.
@@ -333,16 +342,58 @@ impl ShadowMask {
             self.width = width;
             self.height = height;
             self.mask = vec![0; width * height];
-            self.depth = vec![f32::INFINITY; width * height];
-        } else {
-            self.mask.fill(0);
-            self.depth.fill(f32::INFINITY);
+        } else if self.min_x <= self.max_x && self.min_y <= self.max_y {
+            // Only the area touched last frame can be non-zero, so clearing
+            // that box is enough. Shadows usually cover a small part of the
+            // screen, which makes this much cheaper than a full clear at
+            // supersampled resolutions.
+            for y in self.min_y..=self.max_y {
+                let row = y * self.width;
+                self.mask[row + self.min_x..=row + self.max_x].fill(0);
+            }
         }
+        self.min_x = usize::MAX;
+        self.min_y = usize::MAX;
+        self.max_x = 0;
+        self.max_y = 0;
     }
 
-    /// The mask as a render target (writes opaque white where shadowed).
-    fn target(&mut self) -> Target<'_> {
-        Target::new(self.width, self.height, &mut self.mask, &mut self.depth)
+    /// Fills one shadow triangle into the mask. There is no depth test because
+    /// the mask only cares whether a pixel is covered at all.
+    fn cover_triangle(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2]) {
+        draw_triangle_cover(
+            &mut self.mask,
+            self.width,
+            self.height,
+            a,
+            b,
+            c,
+            0x00FF_FFFF,
+        );
+    }
+
+    /// Expands the touched-pixel bounds to include a projected triangle.
+    fn include_bounds(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        let x0 = min_x.floor().clamp(0.0, self.width as f32 - 1.0) as usize;
+        let y0 = min_y.floor().clamp(0.0, self.height as f32 - 1.0) as usize;
+        let x1 = max_x.ceil().clamp(0.0, self.width as f32 - 1.0) as usize;
+        let y1 = max_y.ceil().clamp(0.0, self.height as f32 - 1.0) as usize;
+        self.min_x = self.min_x.min(x0);
+        self.min_y = self.min_y.min(y0);
+        self.max_x = self.max_x.max(x1);
+        self.max_y = self.max_y.max(y1);
+    }
+
+    /// The touched-pixel box, or `None` when nothing was drawn.
+    fn bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        if self.min_x > self.max_x || self.min_y > self.max_y {
+            None
+        } else {
+            Some((self.min_x, self.min_y, self.max_x, self.max_y))
+        }
     }
 
     /// Whether a pixel index is shadowed.
@@ -374,10 +425,9 @@ pub fn render_shadow_into(
     if light_dir.y >= -1e-3 {
         return; // light points up/sideways: no ground shadow
     }
-    let mut target = mask.target();
     let mvp = proj.multiply(&view);
     let model = object.transform;
-    let bias = 0.001; // pull shadows slightly toward the camera (smaller = closer)
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
 
     for tri in object.mesh.indices.chunks(3) {
         let project = |i: u32| -> Option<[f32; 4]> {
@@ -401,29 +451,34 @@ pub fn render_shadow_into(
             let p = [verts[0], verts[i], verts[i + 1]];
             let s = [
                 ndc_to_screen(
-                    Vec3::new(p[0][0] / p[0][3], p[0][1] / p[0][3], p[0][2] / p[0][3]),
-                    target.width,
-                    target.height,
+                    Vec3::new(p[0][0] / p[0][3], p[0][1] / p[0][3], 0.0),
+                    mask.width,
+                    mask.height,
                 ),
                 ndc_to_screen(
-                    Vec3::new(p[1][0] / p[1][3], p[1][1] / p[1][3], p[1][2] / p[1][3]),
-                    target.width,
-                    target.height,
+                    Vec3::new(p[1][0] / p[1][3], p[1][1] / p[1][3], 0.0),
+                    mask.width,
+                    mask.height,
                 ),
                 ndc_to_screen(
-                    Vec3::new(p[2][0] / p[2][3], p[2][1] / p[2][3], p[2][2] / p[2][3]),
-                    target.width,
-                    target.height,
+                    Vec3::new(p[2][0] / p[2][3], p[2][1] / p[2][3], 0.0),
+                    mask.width,
+                    mask.height,
                 ),
             ];
-            draw_triangle_z(
-                &mut target,
-                [s[0].0, s[0].1, p[0][2] / p[0][3] - bias],
-                [s[1].0, s[1].1, p[1][2] / p[1][3] - bias],
-                [s[2].0, s[2].1, p[2][2] / p[2][3] - bias],
-                0x00FF_FFFF,
-            );
+            let x0 = s[0].0.min(s[1].0).min(s[2].0);
+            let x1 = s[0].0.max(s[1].0).max(s[2].0);
+            let y0 = s[0].1.min(s[1].1).min(s[2].1);
+            let y1 = s[0].1.max(s[1].1).max(s[2].1);
+            bounds = Some(match bounds {
+                Some((bx0, by0, bx1, by1)) => (bx0.min(x0), by0.min(y0), bx1.max(x1), by1.max(y1)),
+                None => (x0, y0, x1, y1),
+            });
+            mask.cover_triangle([s[0].0, s[0].1], [s[1].0, s[1].1], [s[2].0, s[2].1]);
         }
+    }
+    if let Some((x0, y0, x1, y1)) = bounds {
+        mask.include_bounds(x0, y0, x1, y1);
     }
 }
 
@@ -450,10 +505,17 @@ fn clip_near_proj(pts: [[f32; 4]; 3], near: f32) -> Poly<[f32; 4]> {
 /// Runs once per pixel, so overlapping shadow geometry cannot stack up.
 pub fn composite_shadow(target: &mut Target, mask: &ShadowMask, tint: [f32; 3]) {
     debug_assert_eq!(mask.mask.len(), target.color.len());
-    for (i, px) in target.color.iter_mut().enumerate() {
-        if mask.is_shadowed(i) {
-            let [r, g, b] = crate::draw::pixel::unpack(*px);
-            *px = rgb(r * tint[0], g * tint[1], b * tint[2]);
+    let Some((x0, y0, x1, y1)) = mask.bounds() else {
+        return;
+    };
+    for y in y0..=y1 {
+        let row = y * target.width;
+        for x in x0..=x1 {
+            let i = row + x;
+            if mask.is_shadowed(i) {
+                let [r, g, b] = crate::draw::pixel::unpack(target.color[i]);
+                target.color[i] = rgb(r * tint[0], g * tint[1], b * tint[2]);
+            }
         }
     }
 }
@@ -536,23 +598,9 @@ mod tests {
         fb.clear(0x808080);
         let mut mask = ShadowMask::new();
         mask.prepare(32, 32);
-        {
-            let mut t = mask.target();
-            draw_triangle_z(
-                &mut t,
-                [0.0, 0.0, 0.0],
-                [31.0, 0.0, 0.0],
-                [0.0, 31.0, 0.0],
-                0x00FF_FFFF,
-            );
-            draw_triangle_z(
-                &mut t,
-                [0.0, 0.0, 0.0],
-                [31.0, 0.0, 0.0],
-                [0.0, 31.0, 0.0],
-                0x00FF_FFFF,
-            );
-        }
+        mask.cover_triangle([0.0, 0.0], [31.0, 0.0], [0.0, 31.0]);
+        mask.cover_triangle([0.0, 0.0], [31.0, 0.0], [0.0, 31.0]);
+        mask.include_bounds(0.0, 0.0, 31.0, 31.0);
         {
             let mut target = fb.target();
             composite_shadow(&mut target, &mask, [0.5, 0.5, 0.5]);
@@ -562,6 +610,20 @@ mod tests {
             (r - 0.25).abs() < 0.02,
             "one composite darkening, got {r} (double-composite would be 0.125)"
         );
+    }
+
+    #[test]
+    fn prepare_clears_the_previous_frame_bounds() {
+        // The mask only clears the box it touched last frame, so make sure a
+        // second prepare leaves no stale coverage behind.
+        let mut mask = ShadowMask::new();
+        mask.prepare(16, 16);
+        mask.cover_triangle([2.0, 2.0], [8.0, 2.0], [2.0, 8.0]);
+        mask.include_bounds(2.0, 2.0, 8.0, 8.0);
+        assert!(mask.bounds().is_some());
+        mask.prepare(16, 16);
+        assert!(mask.mask.iter().all(|&p| p == 0), "stale shadow pixels");
+        assert!(mask.bounds().is_none(), "bounds should reset each frame");
     }
 
     #[test]

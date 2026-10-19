@@ -31,7 +31,7 @@ pub fn draw_triangle_gouraud(
         [a.x, a.y, a.z],
         [b.x, b.y, b.z],
         [c.x, c.y, c.z],
-        &|_, w0, w1, w2| {
+        |_, w0, w1, w2| {
             rgb(
                 a.color[0] * w0 + b.color[0] * w1 + c.color[0] * w2,
                 a.color[1] * w0 + b.color[1] * w1 + c.color[1] * w2,
@@ -46,7 +46,70 @@ pub fn draw_triangle_gouraud(
 /// Each point is `[x, y, z]`: screen pixels plus NDC depth (near = -1,
 /// far = +1; smaller wins).
 pub fn draw_triangle_z(target: &mut Target, a: [f32; 3], b: [f32; 3], c: [f32; 3], color: u32) {
-    rasterize(target, a, b, c, &|_, _, _, _| color);
+    rasterize(target, a, b, c, |_, _, _, _| color);
+}
+
+/// Coverage-only triangle: writes `color` wherever the triangle covers a pixel,
+/// with no depth test and no shading.
+///
+/// This is for binary masks, such as the planar shadow mask, where overlapping
+/// triangles are all the same value. Skipping the depth buffer saves a read, a
+/// compare, and a write per pixel, and the caller does not have to clear or
+/// allocate a depth buffer at all.
+pub(crate) fn draw_triangle_cover(
+    color: &mut [u32],
+    width: usize,
+    height: usize,
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    value: u32,
+) {
+    let min_x = (a[0].min(b[0]).min(c[0]).floor() as i32).max(0);
+    let max_x = (a[0].max(b[0]).max(c[0]).ceil() as i32).min(width as i32 - 1);
+    let min_y = (a[1].min(b[1]).min(c[1]).floor() as i32).max(0);
+    let max_y = (a[1].max(b[1]).max(c[1]).ceil() as i32).min(height as i32 - 1);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let area = edge(a[0], a[1], b[0], b[1], c[0], c[1]);
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let inv_area = 1.0 / area;
+
+    let px = min_x as f32 + 0.5;
+    let py = min_y as f32 + 0.5;
+    let dw0_dx = (b[1] - c[1]) * inv_area;
+    let dw0_dy = (c[0] - b[0]) * inv_area;
+    let dw1_dx = (c[1] - a[1]) * inv_area;
+    let dw1_dy = (a[0] - c[0]) * inv_area;
+    let dw2_dx = (a[1] - b[1]) * inv_area;
+    let dw2_dy = (b[0] - a[0]) * inv_area;
+    let mut w0_row = edge(b[0], b[1], c[0], c[1], px, py) * inv_area;
+    let mut w1_row = edge(c[0], c[1], a[0], a[1], px, py) * inv_area;
+    let mut w2_row = edge(a[0], a[1], b[0], b[1], px, py) * inv_area;
+
+    for y in min_y..=max_y {
+        // The inside region of a triangle on one scanline is a single interval.
+        // Solve each edge for the x range where its weight is >= -epsilon, then
+        // fill the whole span in one go. This skips the per-pixel edge tests
+        // and stores, which is most of the cost for large shadow triangles.
+        if let Some((lo, hi)) = row_span(
+            [w0_row, w1_row, w2_row],
+            [dw0_dx, dw1_dx, dw2_dx],
+            min_x,
+            max_x,
+        ) {
+            let start = y as usize * width + lo as usize;
+            let end = y as usize * width + hi as usize;
+            color[start..=end].fill(value);
+        }
+        w0_row += dw0_dy;
+        w1_row += dw1_dy;
+        w2_row += dw2_dy;
+    }
 }
 
 /// Multiplicative shadow triangle: darkens whatever is already in the frame
@@ -63,21 +126,45 @@ pub fn draw_triangle_shadow(
     c: [f32; 3],
     tint: [f32; 3],
 ) {
-    rasterize(target, a, b, c, &|existing, _, _, _| {
+    rasterize(target, a, b, c, |existing, _, _, _| {
         let [r, g, b] = crate::draw::pixel::unpack(existing);
         rgb(r * tint[0], g * tint[1], b * tint[2])
     });
 }
 
+/// Finds the inclusive x range on one scanline where all three barycentric
+/// weights are inside the triangle. The weights are linear in x, so each edge
+/// gives a lower or upper bound and the inside region is their intersection.
+#[inline]
+fn row_span(w: [f32; 3], dw: [f32; 3], min_x: i32, max_x: i32) -> Option<(i32, i32)> {
+    const EPS: f32 = -1e-4;
+    let mut lo = min_x;
+    let mut hi = max_x;
+    for (w, dw) in w.into_iter().zip(dw) {
+        if dw > 0.0 {
+            let x = min_x as f32 + (EPS - w) / dw;
+            lo = lo.max(x.ceil() as i32);
+        } else if dw < 0.0 {
+            let x = min_x as f32 + (EPS - w) / dw;
+            hi = hi.min(x.floor() as i32);
+        } else if w < EPS {
+            return None;
+        }
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
 /// Shared barycentric/z-test core. `shade` receives the pixel already in the
 /// frame buffer so modes can replace it (flat/Gouraud) or modulate it (shadow).
-fn rasterize(
-    target: &mut Target,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    shade: &dyn Fn(u32, f32, f32, f32) -> u32,
-) {
+///
+/// The edge functions and barycentric weights are stepped incrementally across
+/// each scanline instead of being recomputed with three cross products per
+/// pixel. That matters a lot at supersampled resolutions, where the same
+/// triangle covers 4x or 9x as many pixels.
+fn rasterize<F>(target: &mut Target, a: [f32; 3], b: [f32; 3], c: [f32; 3], shade: F)
+where
+    F: Fn(u32, f32, f32, f32) -> u32,
+{
     // Clamp the bounding box to the screen *before* looping. A vertex clipped
     // at the near plane can project millions of pixels off-screen; without
     // this the per-pixel loop would walk that whole range.
@@ -89,35 +176,68 @@ fn rasterize(
         return; // completely off-screen
     }
 
-    // Barycentric denominator (twice the signed area).
+    // Twice the signed area. This is also the barycentric denominator.
     let area = edge(a[0], a[1], b[0], b[1], c[0], c[1]);
     if area.abs() < f32::EPSILON {
         return; // degenerate
     }
     let inv_area = 1.0 / area;
 
+    // Edge functions at the first pixel center, plus their per-step deltas.
+    // w0 is the weight of a, w1 of b, w2 of c.
+    let px = min_x as f32 + 0.5;
+    let py = min_y as f32 + 0.5;
+    let dw0_dx = (b[1] - c[1]) * inv_area;
+    let dw0_dy = (c[0] - b[0]) * inv_area;
+    let dw1_dx = (c[1] - a[1]) * inv_area;
+    let dw1_dy = (a[0] - c[0]) * inv_area;
+    let dw2_dx = (a[1] - b[1]) * inv_area;
+    let dw2_dy = (b[0] - a[0]) * inv_area;
+    let mut w0_row = edge(b[0], b[1], c[0], c[1], px, py) * inv_area;
+    let mut w1_row = edge(c[0], c[1], a[0], a[1], px, py) * inv_area;
+    let mut w2_row = edge(a[0], a[1], b[0], b[1], px, py) * inv_area;
+    // Depth is linear too, so it can be stepped instead of computed from the
+    // weights on every pixel.
+    let dz_dx = dw0_dx * a[2] + dw1_dx * b[2] + dw2_dx * c[2];
+
+    let width = target.width;
+    let color = &mut target.color[..];
+    let depth = &mut target.depth[..];
+
     for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
+        let Some((lo, hi)) = row_span(
+            [w0_row, w1_row, w2_row],
+            [dw0_dx, dw1_dx, dw2_dx],
+            min_x,
+            max_x,
+        ) else {
+            w0_row += dw0_dy;
+            w1_row += dw1_dy;
+            w2_row += dw2_dy;
+            continue;
+        };
 
-            // Normalized barycentric weights, so w0 + w1 + w2 = 1.
-            let w0 = edge(b[0], b[1], c[0], c[1], px, py) * inv_area;
-            let w1 = edge(c[0], c[1], a[0], a[1], px, py) * inv_area;
-            let w2 = edge(a[0], a[1], b[0], b[1], px, py) * inv_area;
-            if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
-                continue;
-            }
-
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let idx = y as usize * target.width + x as usize;
+        let step = (lo - min_x) as f32;
+        let mut w0 = w0_row + dw0_dx * step;
+        let mut w1 = w1_row + dw1_dx * step;
+        let mut w2 = w2_row + dw2_dx * step;
+        let mut z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+        let row = y as usize * width;
+        for x in lo..=hi {
+            let idx = row + x as usize;
             // Slightly conservative epsilon avoids z-fighting on shared edges.
-            if z >= target.depth[idx] + 1e-6 {
-                continue;
+            if z < depth[idx] + 1e-6 {
+                depth[idx] = z;
+                color[idx] = shade(color[idx], w0, w1, w2);
             }
-            target.depth[idx] = z;
-            target.color[idx] = shade(target.color[idx], w0, w1, w2);
+            w0 += dw0_dx;
+            w1 += dw1_dx;
+            w2 += dw2_dx;
+            z += dz_dx;
         }
+        w0_row += dw0_dy;
+        w1_row += dw1_dy;
+        w2_row += dw2_dy;
     }
 }
 

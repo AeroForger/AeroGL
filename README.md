@@ -171,9 +171,9 @@ Measured on the 1,988-triangle demo scene at 800x800 (release build):
 
 | AA | ms/frame | fps |
 |---|---|---|
-| off | 3.6 | 276 |
-| MSAA 2x (4 samples) | 13.0 | 77 |
-| SMAA | 6.4 | 156 |
+| off | 2.0 | 500 |
+| MSAA 2x (4 samples) | 7.4 | 135 |
+| SMAA | 4.2 | 237 |
 
 ## Shadows
 
@@ -209,7 +209,7 @@ not depend on frame rate.
 | Key or input | Action |
 |---|---|
 | **C** | cycle render mode: shaded, wireframe, then shaded + wireframe |
-| **A** | cycle anti-aliasing: off, MSAA 2x, then SMAA |
+| **A** | cycle anti-aliasing: off, SMAA, then MSAA 2x |
 | **G** | toggle grid |
 | **S** | toggle shadows |
 | **Space** | pause or resume animation |
@@ -252,6 +252,20 @@ Two bugs used to eat most of the frame time. Both are fixed:
 A couple of smaller things: the window title is rebuilt 4 times per second
 instead of every frame, and the FPS cap is set once at startup.
 
+The AA path got the same treatment:
+
+- Without supersampling, the renderer draws straight into the output
+  framebuffer now, so there is no full-frame copy.
+- The 2x2 and 4x4 resolves are separate loops without per-pixel divides.
+- SMAA reuses its luma buffer and blends in place instead of cloning the frame.
+- Shadow masks skip the depth buffer, fill scanline spans, and only clear the
+  box they touched last frame.
+- Triangle fills step the edge and depth values across each scanline instead of
+  recomputing three cross products per pixel.
+
+On the demo scene that took MSAA 2x from about 14.5 ms to 7.4 ms and SMAA from
+6.7 ms to 4.2 ms. Plain rendering also dropped from 3.9 ms to 2.0 ms.
+
 ## Project layout
 
 ```
@@ -284,7 +298,7 @@ tests/
 ## Testing
 
 ```
-cargo test                                                 # 45 unit + 7 integration + 4 doc tests
+cargo test                                                 # 46 unit + 7 integration + 4 doc tests
 cargo test --release -- --ignored --nocapture              # benchmarks
 cargo clippy --all-targets -- -D warnings
 ```

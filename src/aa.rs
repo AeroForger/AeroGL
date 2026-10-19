@@ -47,12 +47,65 @@ pub fn resolve_downsample(
     height: usize,
     factor: usize,
 ) {
-    if factor <= 1 {
-        dst.copy_from_slice(&src[..width * height]);
-        return;
+    match factor {
+        0 | 1 => dst.copy_from_slice(&src[..width * height]),
+        2 => resolve2(src, dst, width, height),
+        4 => resolve4(src, dst, width, height),
+        _ => resolve_generic(src, dst, width, height, factor),
     }
-    let sw = width * factor;
+}
+
+/// 2x2 box resolve. Separate loops and fixed-size chunk iterators let the
+/// compiler drop the bounds checks and the per-pixel divide.
+fn resolve2(src: &[u32], dst: &mut [u32], width: usize, height: usize) {
+    let sw = width * 2;
     for y in 0..height {
+        let row = &src[y * 2 * sw..(y * 2 + 2) * sw];
+        let (r0, r1) = row.split_at(sw);
+        let out = &mut dst[y * width..(y + 1) * width];
+        let (a_chunks, _) = r0.as_chunks::<2>();
+        let (b_chunks, _) = r1.as_chunks::<2>();
+        for (o, (a, b)) in out.iter_mut().zip(a_chunks.iter().zip(b_chunks.iter())) {
+            let r = ((a[0] >> 16) & 0xFF)
+                + ((a[1] >> 16) & 0xFF)
+                + ((b[0] >> 16) & 0xFF)
+                + ((b[1] >> 16) & 0xFF);
+            let g = ((a[0] >> 8) & 0xFF)
+                + ((a[1] >> 8) & 0xFF)
+                + ((b[0] >> 8) & 0xFF)
+                + ((b[1] >> 8) & 0xFF);
+            let bl = (a[0] & 0xFF) + (a[1] & 0xFF) + (b[0] & 0xFF) + (b[1] & 0xFF);
+            *o = ((r >> 2) << 16) | ((g >> 2) << 8) | (bl >> 2);
+        }
+    }
+}
+
+/// 4x4 box resolve.
+fn resolve4(src: &[u32], dst: &mut [u32], width: usize, height: usize) {
+    let sw = width * 4;
+    for y in 0..height {
+        let row = &src[y * 4 * sw..(y * 4 + 4) * sw];
+        let out = &mut dst[y * width..(y + 1) * width];
+        for (x, o) in out.iter_mut().enumerate() {
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for sy in 0..4 {
+                let line = &row[sy * sw + x * 4..sy * sw + x * 4 + 4];
+                for &p in line {
+                    r += (p >> 16) & 0xFF;
+                    g += (p >> 8) & 0xFF;
+                    b += p & 0xFF;
+                }
+            }
+            *o = ((r >> 4) << 16) | ((g >> 4) << 8) | (b >> 4);
+        }
+    }
+}
+
+fn resolve_generic(src: &[u32], dst: &mut [u32], width: usize, height: usize, factor: usize) {
+    let sw = width * factor;
+    let n = (factor * factor) as u32;
+    for y in 0..height {
+        let out_row = y * width;
         for x in 0..width {
             let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
             for sy in 0..factor {
@@ -64,9 +117,22 @@ pub fn resolve_downsample(
                     b += p & 0xFF;
                 }
             }
-            let n = (factor * factor) as u32;
-            dst[y * width + x] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+            dst[out_row + x] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
         }
+    }
+}
+
+/// Scratch buffers for [`apply_smaa_with_scratch`].
+///
+/// Reusing this between frames keeps SMAA from allocating a full-size buffer
+/// every time it runs.
+pub(crate) struct SmaaScratch {
+    luma: Vec<u8>,
+}
+
+impl SmaaScratch {
+    pub(crate) fn new() -> Self {
+        Self { luma: Vec::new() }
     }
 }
 
@@ -76,33 +142,58 @@ pub fn resolve_downsample(
 /// blends the lit side of each edge toward its contrasting neighbour by half a
 /// pixel of coverage, which removes the staircase without a full distance-field
 /// search or the lookup textures the real SMAA uses.
-pub fn apply_smaa(color: &mut [u32], width: usize, height: usize) {
-    let luma: Vec<f32> = color.iter().map(|&p| crate::draw::pixel::luma(p)).collect();
-    let src = color.to_vec();
-    const THRESHOLD: f32 = 0.06;
+#[cfg(test)]
+fn apply_smaa(color: &mut [u32], width: usize, height: usize) {
+    let mut scratch = SmaaScratch::new();
+    apply_smaa_with_scratch(color, width, height, &mut scratch);
+}
 
-    let at = |x: isize, y: isize| -> f32 {
-        let x = x.clamp(0, width as isize - 1) as usize;
-        let y = y.clamp(0, height as isize - 1) as usize;
-        luma[y * width + x]
-    };
+/// Same as [`apply_smaa`], but reuses the supplied buffers.
+pub(crate) fn apply_smaa_with_scratch(
+    color: &mut [u32],
+    width: usize,
+    height: usize,
+    scratch: &mut SmaaScratch,
+) {
+    // The outer pixel ring is left alone. It is the edge of the image, so AA
+    // there is invisible, and skipping it lets the inner loop use direct
+    // neighbor indices instead of clamping every lookup.
+    if width < 3 || height < 3 {
+        return;
+    }
+    let len = width * height;
+    scratch.luma.resize(len, 0);
+    for (l, &p) in scratch.luma.iter_mut().zip(color.iter()) {
+        *l = luma_u8(p);
+    }
 
-    for y in 0..height as isize {
-        for x in 0..width as isize {
-            let c = luma[y as usize * width + x as usize];
-            let l = at(x - 1, y);
-            let r = at(x + 1, y);
-            let u = at(x, y - 1);
-            let d = at(x, y + 1);
+    const THRESHOLD: u8 = 15;
+    let luma = &scratch.luma;
 
-            let dh = (c - l).abs().max((c - r).abs());
-            let dv = (c - u).abs().max((c - d).abs());
+    for y in 1..height - 1 {
+        let row = y * width;
+        let up = row - width;
+        let down = row + width;
+        for x in 1..width - 1 {
+            let i = row + x;
+            let c = luma[i];
+            let l = luma[i - 1];
+            let r = luma[i + 1];
+            let u = luma[up + x];
+            let d = luma[down + x];
+
+            let dl = c.abs_diff(l);
+            let dr = c.abs_diff(r);
+            let du = c.abs_diff(u);
+            let dd = c.abs_diff(d);
+            let dh = dl.max(dr);
+            let dv = du.max(dd);
             if dh.max(dv) < THRESHOLD {
                 continue; // flat region: leave untouched
             }
 
             // Skip local minima (the background side of an edge). Blending
-            // *into* an edge from the dark side is what produces bright halos
+            // into an edge from the dark side is what produces bright halos
             // around bright objects; the lit side alone is enough to soften
             // the silhouette.
             if c <= l && c <= r && c <= u && c <= d {
@@ -111,18 +202,25 @@ pub fn apply_smaa(color: &mut [u32], width: usize, height: usize) {
 
             let (dx, dy) = if dh >= dv {
                 // Horizontal edge: blend along x, toward the contrasting side.
-                (if (c - l).abs() > (c - r).abs() { -1 } else { 1 }, 0)
+                (if dl > dr { -1isize } else { 1 }, 0)
             } else {
-                (0, if (c - u).abs() > (c - d).abs() { -1 } else { 1 })
+                (0, if du > dd { -1isize } else { 1 })
             };
 
-            let nx = (x + dx).clamp(0, width as isize - 1) as usize;
-            let ny = (y + dy).clamp(0, height as isize - 1) as usize;
-            let a = src[y as usize * width + x as usize];
-            let b = src[ny * width + nx];
-            color[y as usize * width + x as usize] = blend_half(a, b);
+            let ni = (i as isize + dy * width as isize + dx) as usize;
+            color[i] = blend_half(color[i], color[ni]);
         }
     }
+}
+
+/// Integer luma in 0..=255. Same weights as `draw::pixel::luma`, but avoiding
+/// a float round trip makes the SMAA edge pass noticeably cheaper.
+#[inline]
+fn luma_u8(color: u32) -> u8 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    ((r * 54 + g * 182 + b * 19) >> 8) as u8
 }
 
 /// 50/50 blend of two packed colors.
@@ -175,13 +273,13 @@ mod tests {
             }
         }
         apply_smaa(&mut img, w, h);
-        let edge_before = 0x000000;
-        assert_ne!(img[w / 2], edge_before, "edge pixel should be blended");
-        let mid = img[w / 2];
+        // The outer pixel ring is skipped, so inspect row 1.
+        let row = w;
+        let mid = img[row + w / 2];
         let r = (mid >> 16) & 0xFF;
         assert!(r > 20 && r < 235, "edge should be a gray blend, got {r}");
         // Away from the edge, colors stay pure.
-        assert_eq!(img[2], 0);
-        assert_eq!(img[w - 2], 0xFFFFFF);
+        assert_eq!(img[row + 2], 0);
+        assert_eq!(img[row + w - 2], 0xFFFFFF);
     }
 }

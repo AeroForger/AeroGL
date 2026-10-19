@@ -3,7 +3,7 @@
 //
 // Controls:
 //   C     cycle object render mode (shaded / wireframe / both)
-//   A     cycle anti-aliasing (off / MSAA x4 / SMAA)
+//   A     cycle anti-aliasing (off / SMAA / MSAA 2x, 4 samples)
 //   G     toggle ground grid
 //   S     toggle shadows
 //   Space pause / resume animation
@@ -43,9 +43,10 @@ fn aa_label(aa: AntiAliasing) -> String {
 
 fn next_aa(aa: AntiAliasing) -> AntiAliasing {
     match aa {
-        AntiAliasing::None => AntiAliasing::Msaa { factor: 2 },
-        AntiAliasing::Msaa { .. } => AntiAliasing::Smaa,
-        AntiAliasing::Smaa => AntiAliasing::None,
+        // Start with the cheap option: SMAA is about half the cost of 4x MSAA.
+        AntiAliasing::None => AntiAliasing::Smaa,
+        AntiAliasing::Smaa => AntiAliasing::Msaa { factor: 2 },
+        AntiAliasing::Msaa { .. } => AntiAliasing::None,
     }
 }
 
