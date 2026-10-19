@@ -308,4 +308,4 @@ behavior, AA resolve and SMAA edge cases, and public API usage.
 
 ## License
 
-MIT OR Apache-2.0.
+Apache-2.0.
