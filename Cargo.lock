@@ -4,9 +4,8 @@ version = 4
 
 [[package]]
 name = "aerogl"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
- "maplit",
  "minifb",
 ]
 
@@ -252,12 +251,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "maplit"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "memchr"
