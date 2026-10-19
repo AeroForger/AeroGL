@@ -189,22 +189,26 @@ renderer.options.max_internal_pixels = Some(3840 * 2160);
 ```
 
 Render-only frame times on the 1,988-triangle demo scene (release build,
-12 hardware threads; presenting the window adds a little more):
+12 hardware threads; presenting the window adds a little more). Measured with
+`cargo test --release -- --ignored --nocapture` on this machine:
 
 | Resolution | AA | ms/frame | fps |
 |---|---|---|---|
-| 800x800 | off | 0.9 | 1107 |
-| 800x800 | MSAA 2x (4 samples) | 2.7 | 370 |
-| 800x800 | SMAA | 1.6 | 635 |
-| 1920x1080 | off | 1.5 | 665 |
-| 1920x1080 | SMAA | 3.0 | 335 |
-| 2560x1440 | off | 2.7 | 370 |
-| 2560x1440 | SMAA | 5.0 | 200 |
+| 800x800 | off | 0.95 | 1054 |
+| 800x800 | MSAA 2x (4 samples) | 2.62 | 382 |
+| 800x800 | SMAA | 1.59 | 628 |
+| 1920x1080 | off | 1.43 | 701 |
+| 1920x1080 | MSAA 2x requested (over budget, runs as SMAA) | 2.61 | 384 |
+| 1920x1080 | SMAA | 2.73 | 367 |
+| 2560x1440 | off | 2.46 | 406 |
+| 2560x1440 | MSAA 2x requested (over budget, runs as SMAA) | 4.68 | 214 |
+| 2560x1440 | SMAA | 4.63 | 216 |
 
-At 1920x1080, a 2x MSAA request is 8,294,400 pixels, over the default 4M
-budget, so it runs as SMAA. Set `max_internal_pixels = None` if you want the
-supersampled frame anyway; at 2560x1440 that costs several times more than
-SMAA on this machine.
+At 1920x1080 a 2x MSAA buffer is 8,294,400 pixels, over the default 4M budget,
+so the request falls back to SMAA, and the table reports that resolved cost.
+Set `max_internal_pixels = None` to render the supersampled frame anyway: the
+showcase harness measures it at about 7.4 ms/frame at 1920x1080, a little over
+twice SMAA, and it climbs fast from there.
 
 ## Shadows
 
