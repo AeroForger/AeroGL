@@ -143,6 +143,29 @@ fn renderer_can_be_resized() {
 }
 
 #[test]
+fn ground_grid_stays_stable_across_camera_angles() {
+    // Regression for the "attempt to add/subtract with overflow" panic in the
+    // banded line rasterizer. A near-horizontal grid line makes the per-band
+    // step range divide by a tiny slope, so the step index can land in the
+    // billions. That has to clamp instead of overflowing i32 inside a worker
+    // thread, which surfaced as "a scoped thread panicked".
+    let scene = scene_with_cube();
+    assert!(
+        scene.ground.grid,
+        "the grid must be on for this test to bite"
+    );
+    let mut renderer = Renderer::new(160, 160);
+    for step in 0..180 {
+        let yaw = step as f32 * std::f32::consts::TAU / 180.0;
+        for pitch in [0.2f32, 0.45] {
+            let camera = Camera::new(yaw, pitch, 7.0);
+            let pixels = renderer.render(&scene, &camera);
+            assert_eq!(pixels.len(), 160 * 160);
+        }
+    }
+}
+
+#[test]
 fn triangle_soup_builds_a_renderable_mesh() {
     // from_triangles derives normals from winding, so this also checks that the
     // derived normal points the same way as the supplied vertex order.

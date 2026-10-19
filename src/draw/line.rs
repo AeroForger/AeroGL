@@ -117,8 +117,15 @@ fn step_range_for_band(
     let a = (band_start - 0.5 - seg.y0) * inv;
     let b = (band_end + 0.5 - seg.y0) * inv;
     let (t0, t1) = if a <= b { (a, b) } else { (b, a) };
-    let i0 = ((t0 * steps as f32).floor() as i32 - 1).max(0);
-    let i1 = ((t1 * steps as f32).ceil() as i32 + 1).min(steps);
+    // A nearly horizontal segment plus a band far from it makes these products
+    // huge (up to ~1e13). Clamp in float first: a raw `as i32` saturates at
+    // i32::MIN/MAX, and the trailing margin would then overflow on the add or
+    // subtract. The margin is only a safety pad, so clamping it is harmless.
+    let limit = steps as f32;
+    let lo = (t0 * limit).floor() - 1.0;
+    let hi = (t1 * limit).ceil() + 1.0;
+    let i0 = lo.max(0.0).min(limit) as i32;
+    let i1 = hi.max(0.0).min(limit) as i32;
     (i0 <= i1).then_some((i0, i1))
 }
 
@@ -259,5 +266,42 @@ mod tests {
         for i in 0..=10 {
             assert_eq!(t.color[i * 20 + i], 1, "diagonal pixel {i}");
         }
+    }
+
+    /// A nearly horizontal segment (dy just above the flat-line cutoff) makes
+    /// the band math divide by a tiny slope, so the step index lands in the
+    /// billions. It must clamp, not overflow i32 on the +/-1 pad.
+    #[test]
+    fn near_horizontal_segment_with_far_bands_does_not_overflow() {
+        let seg = ScreenSeg {
+            x0: 0.0,
+            y0: 40.0,
+            t0: 0.0,
+            x1: 1000.0,
+            y1: 40.0 + 1e-5,
+            t1: 1.0,
+        };
+        let steps = 2000;
+        for (band_start, band_end) in [(0.0, 39.0), (0.0, 200.0), (1500.0, 1600.0)] {
+            if let Some((i0, i1)) = step_range_for_band(&seg, steps, band_start, band_end) {
+                assert!(i0 >= 0 && i1 <= steps && i0 <= i1, "band gave {i0}..{i1}");
+            }
+        }
+    }
+
+    /// End to end: a near-horizontal grid line drawn into every band must still
+    /// light up the row it crosses, exactly like a full-screen draw would.
+    #[test]
+    fn near_horizontal_line_draws_in_the_band_that_owns_its_row() {
+        let mut fb = Framebuffer::new(400, 300);
+        {
+            let mut target = fb.target();
+            let mut bands = target.split_bands(7);
+            for band in &mut bands {
+                draw_line(band, 0.0, 150.0, 399.0, 150.0 + 1e-4, 9);
+            }
+        }
+        let t = fb.target();
+        assert_eq!(t.pixel(200, 150), 9, "row 150 is drawn by its owning band");
     }
 }
