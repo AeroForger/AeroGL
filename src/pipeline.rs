@@ -173,6 +173,9 @@ fn ndc_to_screen(ndc: Vec3, width: usize, height: usize) -> (f32, f32) {
 }
 
 /// Renders one meshed object, honoring its [`DrawMode`].
+///
+/// The object is prepared once and then rasterized. The scene pipeline uses
+/// its internal preparation pass so all bands can share one preparation.
 pub fn render_object(
     target: &mut Target,
     object: &Object,
@@ -181,32 +184,59 @@ pub fn render_object(
     near: f32,
     ctx: &RenderContext,
 ) {
+    let view_proj = proj.multiply(&view);
+    let prepared = prepare_object(object, view_proj, ctx);
+    render_prepared_object(target, object, &prepared, near);
+}
+
+/// Transforms and lights every vertex of one object, once per frame.
+///
+/// Bands only clip and rasterize these vertices, so shared mesh vertices are
+/// shaded once instead of once per triangle per band.
+fn prepare_object(object: &Object, view_proj: Mat4, ctx: &RenderContext) -> Vec<ClipVertex> {
     let model = object.transform;
-    let mv = view.multiply(&model);
-    let mvp = proj.multiply(&mv);
+    let mvp = view_proj.multiply(&model);
+    let shaded = matches!(object.mode, DrawMode::Shaded | DrawMode::ShadedWireframe);
+    let mut out = Vec::with_capacity(object.mesh.vertices.len());
+    for v in &object.mesh.vertices {
+        let color = if shaded {
+            let world = model.transform_point(v.pos);
+            let normal = model.transform_dir(v.normal).normalize();
+            shade_vertex(world, normal, &object.material, ctx)
+        } else {
+            [0.0; 3]
+        };
+        out.push(ClipVertex {
+            pos: mvp.transform_h(v.pos),
+            color,
+        });
+    }
+    out
+}
+
+/// Clips and rasterizes one object from precomputed clip-space vertices.
+fn render_prepared_object(
+    target: &mut Target,
+    object: &Object,
+    prepared: &[ClipVertex],
+    near: f32,
+) {
     let base = object.material.color;
     let wire_col = rgb(
         base[0] * 0.3 + 0.5,
         base[1] * 0.3 + 0.5,
         base[2] * 0.3 + 0.5,
     );
-
     let shaded = matches!(object.mode, DrawMode::Shaded | DrawMode::ShadedWireframe);
     let wireframe = matches!(object.mode, DrawMode::Wireframe | DrawMode::ShadedWireframe);
 
     for tri in object.mesh.indices.chunks(3) {
-        let clip_vert = |i: u32| -> ClipVertex {
-            let v = &object.mesh.vertices[i as usize];
-            let world = model.transform_point(v.pos);
-            let world_n = model.transform_dir(v.normal).normalize();
-            ClipVertex {
-                pos: mvp.transform_h(v.pos),
-                color: shade_vertex(world, world_n, &object.material, ctx),
-            }
-        };
-
         let clipped = clip_near(
-            [clip_vert(tri[0]), clip_vert(tri[1]), clip_vert(tri[2])],
+            [
+                prepared[tri[0] as usize],
+                prepared[tri[1] as usize],
+                prepared[tri[2] as usize],
+            ],
             near,
         );
         if clipped.len() < 3 {
@@ -246,15 +276,34 @@ pub fn render_object(
     }
 }
 
-/// Depth-tested ground grid: minor lines every 1 unit, major every 5.
-pub fn draw_grid(target: &mut Target, view: Mat4, proj: Mat4, near: f32, y: f32, extent: i32) {
+/// One ground-grid segment, already projected to screen space.
+#[derive(Clone, Copy)]
+struct GridSegment {
+    x0: f32,
+    y0: f32,
+    z0: f32,
+    x1: f32,
+    y1: f32,
+    z1: f32,
+    color: u32,
+}
+
+/// Projects the ground grid once per frame.
+fn prepare_grid(
+    view_proj: Mat4,
+    near: f32,
+    width: usize,
+    height: usize,
+    y: f32,
+    extent: i32,
+) -> Vec<GridSegment> {
     let minor = rgb(0.13, 0.19, 0.25);
     let major = rgb(0.20, 0.30, 0.38);
-    let mvp = proj.multiply(&view);
+    let mut out = Vec::with_capacity((extent as usize * 2 + 1) * 2);
 
     let mut segment = |a: Vec3, b: Vec3, color: u32| {
-        let ca = mvp.transform_h(a);
-        let cb = mvp.transform_h(b);
+        let ca = view_proj.transform_h(a);
+        let cb = view_proj.transform_h(b);
         // Clip the segment against the near plane before dividing.
         let (da, db) = (ca[3] - near, cb[3] - near);
         if da < 0.0 && db < 0.0 {
@@ -269,17 +318,17 @@ pub fn draw_grid(target: &mut Target, view: Mat4, proj: Mat4, near: f32, y: f32,
         };
         let za = ca[2] / ca[3];
         let zb = cb[2] / cb[3];
-        let sa = ndc_to_screen(
-            Vec3::new(ca[0] / ca[3], ca[1] / ca[3], za),
-            target.width,
-            target.height,
-        );
-        let sb = ndc_to_screen(
-            Vec3::new(cb[0] / cb[3], cb[1] / cb[3], zb),
-            target.width,
-            target.height,
-        );
-        draw_line_z(target, sa.0, sa.1, za, sb.0, sb.1, zb, color);
+        let sa = ndc_to_screen(Vec3::new(ca[0] / ca[3], ca[1] / ca[3], za), width, height);
+        let sb = ndc_to_screen(Vec3::new(cb[0] / cb[3], cb[1] / cb[3], zb), width, height);
+        out.push(GridSegment {
+            x0: sa.0,
+            y0: sa.1,
+            z0: za,
+            x1: sb.0,
+            y1: sb.1,
+            z1: zb,
+            color,
+        });
     };
 
     for i in -extent..=extent {
@@ -295,6 +344,16 @@ pub fn draw_grid(target: &mut Target, view: Mat4, proj: Mat4, near: f32, y: f32,
             Vec3::new(extent as f32, y, t),
             c,
         );
+    }
+    out
+}
+
+/// Depth-tested ground grid: minor lines every 1 unit, major every 5.
+pub fn draw_grid(target: &mut Target, view: Mat4, proj: Mat4, near: f32, y: f32, extent: i32) {
+    let view_proj = proj.multiply(&view);
+    let segments = prepare_grid(view_proj, near, target.width, target.height, y, extent);
+    for s in &segments {
+        draw_line_z(target, s.x0, s.y0, s.z0, s.x1, s.y1, s.z1, s.color);
     }
 }
 
@@ -325,6 +384,12 @@ pub struct ShadowMask {
     max_x: usize,
     max_y: usize,
 }
+
+/// A screen-space box: `(min_x, min_y, max_x, max_y)` in pixels.
+type ScreenBounds = (f32, f32, f32, f32);
+
+/// Value written into the shadow mask for covered pixels.
+const SHADOW_COVER: u32 = 0x00FF_FFFF;
 
 impl ShadowMask {
     /// An empty mask; it sizes itself on first use.
@@ -358,17 +423,19 @@ impl ShadowMask {
         self.max_y = 0;
     }
 
-    /// Fills one shadow triangle into the mask. There is no depth test because
-    /// the mask only cares whether a pixel is covered at all.
+    /// Fills one shadow triangle into the mask. Used by the shadow tests, where
+    /// driving the full projection machinery would only add noise.
+    #[cfg(test)]
     fn cover_triangle(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2]) {
         draw_triangle_cover(
             &mut self.mask,
             self.width,
+            0,
             self.height,
             a,
             b,
             c,
-            0x00FF_FFFF,
+            SHADOW_COVER,
         );
     }
 
@@ -401,12 +468,189 @@ impl ShadowMask {
     pub fn is_shadowed(&self, idx: usize) -> bool {
         self.mask[idx] != 0
     }
+
+    /// Covers the whole mask with prepared screen-space triangles.
+    fn cover_tris(&mut self, tris: &[ShadowTri]) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        for tri in tris {
+            draw_triangle_cover(
+                &mut self.mask,
+                self.width,
+                0,
+                self.height,
+                tri.a,
+                tri.b,
+                tri.c,
+                SHADOW_COVER,
+            );
+        }
+    }
+
+    /// Sets the touched box from projected floating-point bounds.
+    fn adopt_bounds_f32(&mut self, bounds: Option<ScreenBounds>) {
+        match bounds {
+            Some((x0, y0, x1, y1)) => self.include_bounds(x0, y0, x1, y1),
+            None => {
+                self.min_x = usize::MAX;
+                self.min_y = usize::MAX;
+                self.max_x = 0;
+                self.max_y = 0;
+            }
+        }
+    }
+
+    /// Splits the mask into horizontal bands for parallel shadow projection.
+    ///
+    /// Call [`ShadowMask::prepare`] first. Each band owns a disjoint slice of
+    /// the mask, so bands can be covered on separate threads.
+    pub(crate) fn split_bands(&mut self, count: usize) -> Vec<ShadowBand<'_>> {
+        if self.width == 0 || self.height == 0 {
+            return Vec::new();
+        }
+        let count = count.clamp(1, self.height);
+        let base = self.height / count;
+        let extra = self.height % count;
+        let mut mask: &mut [u32] = &mut self.mask[..];
+        let mut out = Vec::with_capacity(count);
+        let mut y = 0;
+        for i in 0..count {
+            let rows = base + usize::from(i < extra);
+            let len = rows * self.width;
+            let (band_mask, rest) = mask.split_at_mut(len);
+            out.push(ShadowBand {
+                mask: band_mask,
+                width: self.width,
+                y_offset: y,
+                rows,
+                min_x: usize::MAX,
+                min_y: usize::MAX,
+                max_x: 0,
+                max_y: 0,
+            });
+            mask = rest;
+            y += rows;
+        }
+        out
+    }
+}
+
+/// One horizontal band of a [`ShadowMask`], used by the parallel shadow pass.
+pub(crate) struct ShadowBand<'a> {
+    mask: &'a mut [u32],
+    width: usize,
+    y_offset: usize,
+    rows: usize,
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+}
+
+impl ShadowBand<'_> {
+    /// Covers this band with prepared screen-space shadow triangles.
+    fn cover(&mut self, tris: &[ShadowTri]) {
+        let band_start = self.y_offset as f32;
+        let band_end = (self.y_offset + self.rows) as f32;
+        for tri in tris {
+            if tri.max_y < band_start || tri.min_y >= band_end {
+                continue;
+            }
+            draw_triangle_cover(
+                self.mask,
+                self.width,
+                self.y_offset,
+                self.rows,
+                tri.a,
+                tri.b,
+                tri.c,
+                SHADOW_COVER,
+            );
+        }
+    }
+
+    /// Restricts the band's composite box to the projected shadow bounds.
+    fn set_bounds(&mut self, bounds: Option<ScreenBounds>) {
+        let Some((x0, y0, x1, y1)) = bounds else {
+            return;
+        };
+        let band_end = self.y_offset + self.rows;
+        let y0 = (y0.floor().max(0.0) as usize).max(self.y_offset);
+        let y1 = (y1.ceil().max(0.0) as usize).min(band_end - 1);
+        if y0 > y1 || self.width == 0 {
+            return;
+        }
+        self.min_x = x0.floor().clamp(0.0, self.width as f32 - 1.0) as usize;
+        self.max_x = x1.ceil().clamp(0.0, self.width as f32 - 1.0) as usize;
+        self.min_y = y0;
+        self.max_y = y1;
+    }
+
+    /// Darkens the matching slice of the color buffer once.
+    fn composite_into(&self, color: &mut [u32], tint: [f32; 3]) {
+        if self.min_x > self.max_x || self.min_y > self.max_y {
+            return;
+        }
+        let tables = tint_tables(tint);
+        let band_end = self.y_offset + self.rows;
+        let y0 = self.min_y.max(self.y_offset);
+        let y1 = self.max_y.min(band_end - 1);
+        if y0 > y1 {
+            return;
+        }
+        for y in y0..=y1 {
+            let row = (y - self.y_offset) * self.width;
+            let mask = &self.mask[row + self.min_x..=row + self.max_x];
+            let pixels = &mut color[row + self.min_x..=row + self.max_x];
+            for (covered, pixel) in mask.iter().zip(pixels) {
+                if *covered != 0 {
+                    *pixel = tint_pixel(*pixel, &tables);
+                }
+            }
+        }
+    }
+}
+
+/// Builds per-channel 8-bit lookup tables for a shadow tint.
+///
+/// The composite pass runs over every shadowed pixel. A table lookup replaces
+/// an unpack, three float multiplies and a clamp.
+fn tint_tables(tint: [f32; 3]) -> [[u8; 256]; 3] {
+    let mut tables = [[0u8; 256]; 3];
+    for (table, scale) in tables.iter_mut().zip(tint) {
+        for (value, out) in table.iter_mut().enumerate() {
+            *out = (value as f32 * scale).clamp(0.0, 255.0) as u8;
+        }
+    }
+    tables
+}
+
+#[inline]
+fn tint_pixel(color: u32, tables: &[[u8; 256]; 3]) -> u32 {
+    let r = u32::from(tables[0][((color >> 16) & 0xFF) as usize]);
+    let g = u32::from(tables[1][((color >> 8) & 0xFF) as usize]);
+    let b = u32::from(tables[2][(color & 0xFF) as usize]);
+    (r << 16) | (g << 8) | b
 }
 
 /// Projects a world point onto a horizontal plane along the light direction.
 pub fn project_to_plane(p: Vec3, plane_y: f32, light_dir: Vec3) -> Vec3 {
     let t = (plane_y - p.y) / light_dir.y;
     p + light_dir.scale(t)
+}
+
+/// A ground-shadow triangle already projected to screen space.
+///
+/// Projecting once per frame instead of once per band is the difference
+/// between roughly 2,000 and 16,000 transforms for the demo scene.
+#[derive(Clone, Copy)]
+struct ShadowTri {
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    min_y: f32,
+    max_y: f32,
 }
 
 /// Renders the hard shadow of one object into the mask.
@@ -422,12 +666,42 @@ pub fn render_shadow_into(
     plane_y: f32,
     light_dir: Vec3,
 ) {
-    if light_dir.y >= -1e-3 {
-        return; // light points up/sideways: no ground shadow
+    let (width, height) = (mask.width, mask.height);
+    if width == 0 || height == 0 || light_dir.y >= -1e-3 {
+        return;
     }
-    let mvp = proj.multiply(&view);
+    let view_proj = proj.multiply(&view);
+    let mut tris = Vec::new();
+    let mut bounds = None;
+    prepare_shadow_object(
+        object,
+        view_proj,
+        near,
+        width,
+        height,
+        plane_y,
+        light_dir,
+        &mut tris,
+        &mut bounds,
+    );
+    mask.cover_tris(&tris);
+    mask.adopt_bounds_f32(bounds);
+}
+
+/// Projects one object's ground shadow to screen-space triangles.
+#[allow(clippy::too_many_arguments)] // a projection plus the buffers it fills
+fn prepare_shadow_object(
+    object: &Object,
+    view_proj: Mat4,
+    near: f32,
+    width: usize,
+    height: usize,
+    plane_y: f32,
+    light_dir: Vec3,
+    out: &mut Vec<ShadowTri>,
+    bounds: &mut Option<ScreenBounds>,
+) {
     let model = object.transform;
-    let mut bounds: Option<(f32, f32, f32, f32)> = None;
 
     for tri in object.mesh.indices.chunks(3) {
         let project = |i: u32| -> Option<[f32; 4]> {
@@ -436,7 +710,7 @@ pub fn render_shadow_into(
                 return None; // clearly below the ground: would cast backwards
             }
             let q = project_to_plane(world, plane_y, light_dir);
-            Some(mvp.transform_h(q))
+            Some(view_proj.transform_h(q))
         };
         let (Some(a), Some(b), Some(c)) = (project(tri[0]), project(tri[1]), project(tri[2]))
         else {
@@ -452,34 +726,74 @@ pub fn render_shadow_into(
             let s = [
                 ndc_to_screen(
                     Vec3::new(p[0][0] / p[0][3], p[0][1] / p[0][3], 0.0),
-                    mask.width,
-                    mask.height,
+                    width,
+                    height,
                 ),
                 ndc_to_screen(
                     Vec3::new(p[1][0] / p[1][3], p[1][1] / p[1][3], 0.0),
-                    mask.width,
-                    mask.height,
+                    width,
+                    height,
                 ),
                 ndc_to_screen(
                     Vec3::new(p[2][0] / p[2][3], p[2][1] / p[2][3], 0.0),
-                    mask.width,
-                    mask.height,
+                    width,
+                    height,
                 ),
             ];
             let x0 = s[0].0.min(s[1].0).min(s[2].0);
             let x1 = s[0].0.max(s[1].0).max(s[2].0);
             let y0 = s[0].1.min(s[1].1).min(s[2].1);
             let y1 = s[0].1.max(s[1].1).max(s[2].1);
-            bounds = Some(match bounds {
+            if x1 < 0.0 || x0 >= width as f32 || y1 < 0.0 || y0 >= height as f32 {
+                continue; // no visible pixels, so no bounds entry either
+            }
+            *bounds = Some(match *bounds {
                 Some((bx0, by0, bx1, by1)) => (bx0.min(x0), by0.min(y0), bx1.max(x1), by1.max(y1)),
                 None => (x0, y0, x1, y1),
             });
-            mask.cover_triangle([s[0].0, s[0].1], [s[1].0, s[1].1], [s[2].0, s[2].1]);
+            out.push(ShadowTri {
+                a: [s[0].0, s[0].1],
+                b: [s[1].0, s[1].1],
+                c: [s[2].0, s[2].1],
+                min_y: y0,
+                max_y: y1,
+            });
         }
     }
-    if let Some((x0, y0, x1, y1)) = bounds {
-        mask.include_bounds(x0, y0, x1, y1);
+}
+
+/// Projects every shadow caster once per frame.
+fn prepare_shadows(
+    scene: &Scene,
+    view_proj: Mat4,
+    near: f32,
+    width: usize,
+    height: usize,
+    plane_y: f32,
+    light_dir: Vec3,
+) -> (Vec<ShadowTri>, Option<ScreenBounds>) {
+    if light_dir.y >= -1e-3 {
+        return (Vec::new(), None); // light points up/sideways: no ground shadow
     }
+    let mut tris = Vec::new();
+    let mut bounds = None;
+    for object in &scene.objects {
+        if !object.casts_shadow {
+            continue;
+        }
+        prepare_shadow_object(
+            object,
+            view_proj,
+            near,
+            width,
+            height,
+            plane_y,
+            light_dir,
+            &mut tris,
+            &mut bounds,
+        );
+    }
+    (tris, bounds)
 }
 
 /// Near-plane clip for raw clip-space polygons (shadow geometry).
@@ -504,51 +818,187 @@ fn clip_near_proj(pts: [[f32; 4]; 3], near: f32) -> Poly<[f32; 4]> {
 ///
 /// Runs once per pixel, so overlapping shadow geometry cannot stack up.
 pub fn composite_shadow(target: &mut Target, mask: &ShadowMask, tint: [f32; 3]) {
-    debug_assert_eq!(mask.mask.len(), target.color.len());
+    debug_assert!(
+        mask.mask.len() >= target.width * target.height,
+        "shadow mask must cover the full screen"
+    );
     let Some((x0, y0, x1, y1)) = mask.bounds() else {
         return;
     };
+    // The target may be one band of the screen; only touch its own rows.
+    let y0 = y0.max(target.band_offset());
+    let y1 = y1.min(target.band_end() - 1);
+    if y0 > y1 {
+        return;
+    }
+    let tables = tint_tables(tint);
     for y in y0..=y1 {
-        let row = y * target.width;
-        for x in x0..=x1 {
-            let i = row + x;
-            if mask.is_shadowed(i) {
-                let [r, g, b] = crate::draw::pixel::unpack(target.color[i]);
-                target.color[i] = rgb(r * tint[0], g * tint[1], b * tint[2]);
+        let mask_row = y * target.width;
+        let out_row = (y - target.band_offset()) * target.width;
+        let covered = &mask.mask[mask_row + x0..=mask_row + x1];
+        let pixels = &mut target.color[out_row + x0..=out_row + x1];
+        for (is_set, pixel) in covered.iter().zip(pixels) {
+            if *is_set != 0 {
+                *pixel = tint_pixel(*pixel, &tables);
             }
         }
     }
 }
 
+/// Everything that is the same for every band: lit vertices, projected
+/// shadows and projected grid segments.
+struct PreparedFrame {
+    objects: Vec<Vec<ClipVertex>>,
+    shadow_tris: Vec<ShadowTri>,
+    shadow_bounds: Option<ScreenBounds>,
+    grid: Vec<GridSegment>,
+}
+
+/// Builds the per-frame data shared by all render bands.
+fn prepare_frame(
+    scene: &Scene,
+    view_proj: Mat4,
+    near: f32,
+    width: usize,
+    height: usize,
+    ctx: &RenderContext,
+) -> PreparedFrame {
+    let objects = scene
+        .objects
+        .iter()
+        .map(|object| prepare_object(object, view_proj, ctx))
+        .collect();
+    let (shadow_tris, shadow_bounds) = if scene.ground.shadows {
+        prepare_shadows(
+            scene,
+            view_proj,
+            near,
+            width,
+            height,
+            scene.ground.y,
+            ctx.light_dir,
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    let grid = if scene.ground.grid {
+        prepare_grid(view_proj, near, width, height, scene.ground.y, 10)
+    } else {
+        Vec::new()
+    };
+    PreparedFrame {
+        objects,
+        shadow_tris,
+        shadow_bounds,
+        grid,
+    }
+}
+
 /// Renders an entire scene: ground grid, planar shadows, then objects.
+///
+/// When the target is a full screen and large enough, the grid, shadow mask,
+/// shadow composite and object passes all run band by band on worker threads.
+/// Every band owns distinct color, depth and mask rows, so no pass needs a lock.
 pub fn render_scene(target: &mut Target, scene: &Scene, camera: &Camera, shadow: &mut ShadowMask) {
+    render_scene_with(target, scene, camera, shadow, None);
+}
+
+/// Like [`render_scene`], but also clears color and depth per band before
+/// drawing.
+///
+/// Clearing inside the band pass keeps each band's rows hot in cache and avoids
+/// a separate full-frame clear. This is what [`crate::Renderer`] uses.
+pub fn render_scene_clear(
+    target: &mut Target,
+    scene: &Scene,
+    camera: &Camera,
+    shadow: &mut ShadowMask,
+    background: u32,
+) {
+    render_scene_with(target, scene, camera, shadow, Some(background));
+}
+
+fn render_scene_with(
+    target: &mut Target,
+    scene: &Scene,
+    camera: &Camera,
+    shadow: &mut ShadowMask,
+    background: Option<u32>,
+) {
     let view = camera.view();
     let proj = camera.projection(target.width as f32 / target.height as f32);
+    let view_proj = proj.multiply(&view);
     let near = camera.near;
     let ctx = RenderContext::new(camera.eye(), &scene.light);
+    let prep = prepare_frame(scene, view_proj, near, target.width, target.height, &ctx);
+    let threads = if target.band_rows() == target.height {
+        crate::parallel::threads_for(target.width * target.height, 200_000)
+    } else {
+        1
+    };
 
-    if scene.ground.grid {
-        draw_grid(target, view, proj, near, scene.ground.y, 10);
+    if threads <= 1 {
+        if let Some(bg) = background {
+            target.clear(bg);
+        }
+        draw_grid_segments(target, &prep.grid);
+        if scene.ground.shadows {
+            shadow.prepare(target.width, target.height);
+            shadow.cover_tris(&prep.shadow_tris);
+            shadow.adopt_bounds_f32(prep.shadow_bounds);
+            composite_shadow(target, shadow, scene.ground.shadow_tint);
+        }
+        for (object, prepared) in scene.objects.iter().zip(&prep.objects) {
+            render_prepared_object(target, object, prepared, near);
+        }
+        return;
     }
 
     if scene.ground.shadows {
         shadow.prepare(target.width, target.height);
-        for object in scene.objects.iter().filter(|o| o.casts_shadow) {
-            render_shadow_into(
-                shadow,
-                object,
-                view,
-                proj,
-                near,
-                scene.ground.y,
-                ctx.light_dir,
-            );
-        }
-        composite_shadow(target, shadow, scene.ground.shadow_tint);
     }
+    let tint = scene.ground.shadow_tint;
+    let bands = target.split_bands(threads);
+    let mut shadow_bands: Vec<Option<ShadowBand<'_>>> = if scene.ground.shadows {
+        shadow.split_bands(threads).into_iter().map(Some).collect()
+    } else {
+        (0..bands.len()).map(|_| None).collect()
+    };
+    let PreparedFrame {
+        objects,
+        shadow_tris,
+        shadow_bounds,
+        grid,
+    } = &prep;
 
-    for object in &scene.objects {
-        render_object(target, object, view, proj, near, &ctx);
+    std::thread::scope(|scope| {
+        for (mut band, shadow_band) in bands.into_iter().zip(shadow_bands.drain(..)) {
+            scope.spawn(move || {
+                if let Some(bg) = background {
+                    band.clear(bg);
+                }
+                draw_grid_segments(&mut band, grid);
+                if let Some(mut shadow_band) = shadow_band {
+                    shadow_band.cover(shadow_tris);
+                    shadow_band.set_bounds(*shadow_bounds);
+                    shadow_band.composite_into(band.color, tint);
+                }
+                for (object, prepared) in scene.objects.iter().zip(objects) {
+                    render_prepared_object(&mut band, object, prepared, near);
+                }
+            });
+        }
+    });
+
+    if scene.ground.shadows {
+        shadow.adopt_bounds_f32(*shadow_bounds);
+    }
+}
+
+/// Draws precomputed grid segments into a target (or band).
+fn draw_grid_segments(target: &mut Target, segments: &[GridSegment]) {
+    for s in segments {
+        draw_line_z(target, s.x0, s.y0, s.z0, s.x1, s.y1, s.z1, s.color);
     }
 }
 
@@ -634,6 +1084,49 @@ mod tests {
         let lit = shade_vertex(Vec3::ZERO, up, &m, &ctx);
         let dark = shade_vertex(Vec3::ZERO, -up, &m, &ctx);
         assert!(lit[0] > dark[0] * 2.0, "lit {lit:?} vs dark {dark:?}");
+    }
+
+    #[test]
+    fn render_scene_on_bands_matches_the_full_frame() {
+        // Target::band is public API. A band must compose shadows and draw the
+        // grid against the full screen, not against its own row range.
+        let (width, height) = (64, 48);
+        let background = 0x102030;
+        let camera = Camera::new(0.6, 0.35, 8.0);
+        let mut scene = Scene::new();
+        scene.add(
+            Object::new(crate::mesh::Mesh::cube(), Material::new([0.9, 0.4, 0.2]))
+                .with_transform(Mat4::translation(Vec3::new(0.0, 0.8, 0.0))),
+        );
+
+        let mut full = Framebuffer::new(width, height);
+        let mut mask = ShadowMask::new();
+        {
+            let mut target = full.target();
+            render_scene_clear(&mut target, &scene, &camera, &mut mask, background);
+        }
+
+        let split = height / 2;
+        let mut banded = Framebuffer::new(width, height);
+        let (top_color, bottom_color) = banded.color.split_at_mut(split * width);
+        let (top_depth, bottom_depth) = banded.depth.split_at_mut(split * width);
+        {
+            let mut target = Target::band(width, height, 0, split, top_color, top_depth);
+            render_scene_clear(&mut target, &scene, &camera, &mut mask, background);
+        }
+        {
+            let mut target = Target::band(
+                width,
+                height,
+                split,
+                height - split,
+                bottom_color,
+                bottom_depth,
+            );
+            render_scene_clear(&mut target, &scene, &camera, &mut mask, background);
+        }
+
+        assert_eq!(full.color, banded.color, "banded frame differs");
     }
 
     #[test]

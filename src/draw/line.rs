@@ -34,12 +34,34 @@ pub fn clip_segment_screen(
     x1: f32,
     y1: f32,
 ) -> Option<ScreenSeg> {
-    let (dx, dy) = (x1 - x0, y1 - y0);
-    let max_x = width as f32 - 1.0;
-    let max_y = height as f32 - 1.0;
+    clip_segment_rect(
+        0.0,
+        width as f32 - 1.0,
+        0.0,
+        height as f32 - 1.0,
+        x0,
+        y0,
+        x1,
+        y1,
+    )
+}
 
+/// Same clip, but against an arbitrary rectangle. Bands use a y range inside
+/// the full screen so a line only steps through rows that band owns.
+#[allow(clippy::too_many_arguments)] // clip rectangle plus the segment
+fn clip_segment_rect(
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> Option<ScreenSeg> {
+    let (dx, dy) = (x1 - x0, y1 - y0);
     let p = [-dx, dx, -dy, dy];
-    let q = [x0, max_x - x0, y0, max_y - y0];
+    let q = [x0 - x_min, x_max - x0, y0 - y_min, y_max - y0];
 
     let (mut t0, mut t1) = (0.0f32, 1.0f32);
     for i in 0..4 {
@@ -75,7 +97,37 @@ fn step_count(seg: &ScreenSeg, width: usize, height: usize) -> i32 {
     steps.clamp(0, 2 * (width + height) as i32)
 }
 
+/// Step indices whose sampled points can land in `[band_start, band_end]`.
+///
+/// Sampling stays based on the full segment, so the chosen pixels are exactly
+/// the ones a full-screen draw would produce. The band only narrows the range,
+/// which keeps a banded grid from walking the whole line again on every thread.
+fn step_range_for_band(
+    seg: &ScreenSeg,
+    steps: i32,
+    band_start: f32,
+    band_end: f32,
+) -> Option<(i32, i32)> {
+    let dy = seg.y1 - seg.y0;
+    if dy.abs() < 1e-6 {
+        let y = seg.y0.round();
+        return (y >= band_start && y <= band_end).then_some((0, steps));
+    }
+    let inv = 1.0 / dy;
+    let a = (band_start - 0.5 - seg.y0) * inv;
+    let b = (band_end + 0.5 - seg.y0) * inv;
+    let (t0, t1) = if a <= b { (a, b) } else { (b, a) };
+    let i0 = ((t0 * steps as f32).floor() as i32 - 1).max(0);
+    let i1 = ((t1 * steps as f32).ceil() as i32 + 1).min(steps);
+    (i0 <= i1).then_some((i0, i1))
+}
+
 /// Draws a 1-pixel line with no depth test (overwrites).
+///
+/// Lines clip to the full screen, not to the target's band. A band iterates
+/// only the step indices that can reach its rows, while sampling with the full
+/// segment's step count, so it lands on exactly the same pixels as a
+/// single-threaded full-screen draw.
 pub fn draw_line(target: &mut Target, x0: f32, y0: f32, x1: f32, y1: f32, color: u32) {
     let Some(seg) = clip_segment_screen(target.width, target.height, x0, y0, x1, y1) else {
         return;
@@ -85,13 +137,21 @@ pub fn draw_line(target: &mut Target, x0: f32, y0: f32, x1: f32, y1: f32, color:
         target.set_pixel(seg.x0.round() as i32, seg.y0.round() as i32, color);
         return;
     }
+    let Some((i0, i1)) = step_range_for_band(
+        &seg,
+        steps,
+        target.band_offset() as f32,
+        target.band_end() as f32 - 1.0,
+    ) else {
+        return;
+    };
     let (dx, dy) = (seg.x1 - seg.x0, seg.y1 - seg.y0);
-    let (x_inc, y_inc) = (dx / steps as f32, dy / steps as f32);
-    let (mut x, mut y) = (seg.x0, seg.y0);
-    for _ in 0..=steps {
+    let inv = 1.0 / steps as f32;
+    for i in i0..=i1 {
+        let s = i as f32 * inv;
+        let x = seg.x0 + dx * s;
+        let y = seg.y0 + dy * s;
         target.set_pixel(x.round() as i32, y.round() as i32, color);
-        x += x_inc;
-        y += y_inc;
     }
 }
 
@@ -115,16 +175,25 @@ pub fn draw_line_z(
     let inv = if steps == 0 { 0.0 } else { 1.0 / steps as f32 };
     let (dx, dy) = (seg.x1 - seg.x0, seg.y1 - seg.y0);
     let dt = seg.t1 - seg.t0;
+    let band_start = target.band_offset();
+    let Some((i0, i1)) = step_range_for_band(
+        &seg,
+        steps,
+        band_start as f32,
+        target.band_end() as f32 - 1.0,
+    ) else {
+        return;
+    };
 
-    for i in 0..=steps {
+    for i in i0..=i1 {
         let s = i as f32 * inv;
         let t = seg.t0 + dt * s;
         let x = (seg.x0 + dx * s).round() as i32;
         let y = (seg.y0 + dy * s).round() as i32;
-        if !(0..target.width as i32).contains(&x) || !(0..target.height as i32).contains(&y) {
+        if !(0..target.width as i32).contains(&x) || !target.contains_row(y) {
             continue;
         }
-        let idx = y as usize * target.width + x as usize;
+        let idx = (y as usize - band_start) * target.width + x as usize;
         let z = lerp(z0, z1, t);
         if z <= target.depth[idx] {
             target.depth[idx] = z;

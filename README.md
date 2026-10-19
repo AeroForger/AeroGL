@@ -32,11 +32,16 @@ let pixels: &[u32] = renderer.render(&scene, &Camera::default());
   near-plane clipping (Sutherland-Hodgman in clip space), backface culling, and
   Gouraud Blinn-Phong shading (diffuse, specular, and a bit of rim light).
 - Two anti-aliasing modes, `Msaa { factor }` and `Smaa`, and you can switch
-  between them at runtime.
+  between them at runtime. If a supersampled request would create a huge frame,
+  the renderer falls back to SMAA automatically, so a large window cannot
+  silently cost 4x the fill rate.
 - Planar shadows that do not stack. Shadow geometry goes into an offscreen
-  mask, then gets mixed in once per pixel, so overlapping triangles cannot make
-  the same spot darker and darker.
+  binary mask, then gets mixed in once per pixel, so overlapping triangles
+  cannot make the same spot darker and darker.
 - Any resolution. Nothing is locked to 800x800, and you can resize whenever.
+- Uses all your cores when the frame is big enough. Pixel work is split into
+  horizontal bands; small frames stay single-threaded so thread startup never
+  costs more than it saves.
 - Runs on anything with `std`. The core has no platform code, and the window is
   opt in.
 
@@ -80,6 +85,8 @@ use aerogl::{AntiAliasing, Camera, Renderer, Scene};
 let mut renderer = Renderer::new(1280, 720);
 renderer.options.aa = AntiAliasing::Msaa { factor: 2 };
 renderer.options.background = 0x0010_1820;
+// Optional: allow a bigger supersampled buffer before falling back to SMAA.
+renderer.options.max_internal_pixels = Some(8_000_000);
 
 let scene = Scene::new();
 let pixels = renderer.render(&scene, &Camera::default());
@@ -99,7 +106,7 @@ or your own toolkit.
 
 | Type | What it does |
 |---|---|
-| `Renderer` | Holds the buffers, runs the pipeline, and returns pixels. Settings live in `options.aa` and `options.background`. |
+| `Renderer` | Holds the buffers, runs the pipeline, and returns pixels. Settings live in `options.aa`, `options.background`, and `options.max_internal_pixels`. `active_aa()` reports the mode actually used at the current size. |
 | `Scene` | Objects, one `DirectionalLight`, and `Ground` settings (`grid`, `shadows`, `shadow_tint`). |
 | `Object` | `mesh`, `transform`, `material`, `mode`, `casts_shadow`. Builders: `with_transform`, `with_mode`, `with_shadow`. |
 | `DrawMode` | `Shaded`, `Wireframe`, `ShadedWireframe`. |
@@ -167,13 +174,37 @@ renderer.options.aa = AntiAliasing::Smaa;                 // post-process
   a filter, so it cannot bring back detail that was never sampled. Very thin
   bright lines can lose a little contrast. It runs after the resolve.
 
-Measured on the 1,988-triangle demo scene at 800x800 (release build):
+Supersampling cost grows with the square of the factor. A 2x request at
+2560x1440 would allocate a 5120x2880 frame, four times the pixels of the
+window. `RenderOptions::max_internal_pixels` puts a ceiling on that: when the
+requested buffer is larger, the renderer uses SMAA instead. The default is
+4,000,000 pixels. `Renderer::active_aa()` tells you what actually ran.
 
-| AA | ms/frame | fps |
-|---|---|---|
-| off | 2.0 | 500 |
-| MSAA 2x (4 samples) | 7.4 | 135 |
-| SMAA | 4.2 | 237 |
+```rust
+// Force MSAA even over the budget (you are choosing the cost).
+renderer.options.max_internal_pixels = None;
+
+// Or allow a 4K supersampled buffer, still falling back above that.
+renderer.options.max_internal_pixels = Some(3840 * 2160);
+```
+
+Render-only frame times on the 1,988-triangle demo scene (release build,
+12 hardware threads; presenting the window adds a little more):
+
+| Resolution | AA | ms/frame | fps |
+|---|---|---|---|
+| 800x800 | off | 0.9 | 1107 |
+| 800x800 | MSAA 2x (4 samples) | 2.7 | 370 |
+| 800x800 | SMAA | 1.6 | 635 |
+| 1920x1080 | off | 1.5 | 665 |
+| 1920x1080 | SMAA | 3.0 | 335 |
+| 2560x1440 | off | 2.7 | 370 |
+| 2560x1440 | SMAA | 5.0 | 200 |
+
+At 1920x1080, a 2x MSAA request is 8,294,400 pixels, over the default 4M
+budget, so it runs as SMAA. Set `max_internal_pixels = None` if you want the
+supersampled frame anyway; at 2560x1440 that costs several times more than
+SMAA on this machine.
 
 ## Shadows
 
@@ -181,11 +212,11 @@ Objects project onto the ground plane along the light direction. Each frame
 does this:
 
 1. Draw the ground grid.
-2. Render shadow triangles into an offscreen **mask** with its own depth
-   buffer. Covered pixels are white.
+2. Render shadow triangles into an offscreen **binary mask**. There is no depth
+   buffer here: the mask only records whether a pixel is covered at all.
 3. Mix the mask into the frame **once** by multiplying with
    `Ground::shadow_tint`.
-4. Draw the objects. The z-buffer hides shadows behind them.
+4. Draw the objects on top.
 
 Step 3 runs once per pixel, so any number of overlapping shadow triangles gives
 you one tint. That is the fix for the blotchy, double-darkened shadows from the
@@ -209,7 +240,7 @@ not depend on frame rate.
 | Key or input | Action |
 |---|---|
 | **C** | cycle render mode: shaded, wireframe, then shaded + wireframe |
-| **A** | cycle anti-aliasing: off, SMAA, then MSAA 2x |
+| **A** | cycle anti-aliasing: off, SMAA, then MSAA 2x (shown as capped when the buffer is too large) |
 | **G** | toggle grid |
 | **S** | toggle shadows |
 | **Space** | pause or resume animation |
@@ -257,14 +288,39 @@ The AA path got the same treatment:
 - Without supersampling, the renderer draws straight into the output
   framebuffer now, so there is no full-frame copy.
 - The 2x2 and 4x4 resolves are separate loops without per-pixel divides.
-- SMAA reuses its luma buffer and blends in place instead of cloning the frame.
+- SMAA builds a luma map, marks edge tiles, and records edge blends in compact
+  per-band lists instead of copying the whole frame and writing in place.
 - Shadow masks skip the depth buffer, fill scanline spans, and only clear the
   box they touched last frame.
-- Triangle fills step the edge and depth values across each scanline instead of
-  recomputing three cross products per pixel.
+- Triangle fills step the edge, depth and color values across each scanline
+  instead of recomputing three cross products per pixel.
+- Shadow tinting uses per-channel lookup tables, not a float unpack and repack
+  per shadowed pixel.
 
-On the demo scene that took MSAA 2x from about 14.5 ms to 7.4 ms and SMAA from
-6.7 ms to 4.2 ms. Plain rendering also dropped from 3.9 ms to 2.0 ms.
+Then the frame was split across cores:
+
+- Meshes are transformed and lit once per frame, and shadow and grid geometry
+  is projected once per frame. Bands only clip and rasterize the prepared data,
+  so shared mesh vertices are shaded once instead of once per band.
+- Objects, grid drawing and shadow compositing all run band by band in one
+  thread scope. Each band owns distinct color, depth and mask rows, so there
+  are no locks.
+- The framebuffer clear and the MSAA downsample are also banded.
+- SMAA builds its luma map, marks edge tiles, and blends in three parallel
+  passes. Flat 16x16 tiles are skipped entirely.
+- Bands step triangle weights from the triangle's own top, not from the band
+  top, so a banded frame is pixel-for-pixel identical to a single-threaded one.
+  There is a test for that, and one for each AA mode.
+- Below about 200k pixels the renderer stays single-threaded; thread startup
+  costs more than the work.
+
+`AEROGL_THREADS=4 cargo run --release` caps the worker count. The default is
+`available_parallelism()`, capped at 16.
+
+On this machine (12 threads), the demo scene went from 3.9 ms to 0.9 ms at
+800x800 with AA off. At 2560x1440, off is 2.7 ms, SMAA is 5.0 ms, and a 2x MSAA
+request is redirected to SMAA by the default pixel budget. Before the parallel
+pass and the merged clear, the same 1440p SMAA frame took about 17.8 ms.
 
 ## Project layout
 
@@ -282,6 +338,7 @@ src/
   material.rs     Blinn-Phong material parameters
   light.rs        DirectionalLight
   aa.rs           MSAA resolve + simplified SMAA
+  parallel.rs     worker-count helpers and the AEROGL_THREADS override
   draw/
     pixel.rs      color packing, edge function, lerp, luma
     line.rs       clipped lines with optional depth test
@@ -298,7 +355,7 @@ tests/
 ## Testing
 
 ```
-cargo test                                                 # 46 unit + 7 integration + 4 doc tests
+cargo test                                                 # 52 unit + 7 integration + 4 doc tests
 cargo test --release -- --ignored --nocapture              # benchmarks
 cargo clippy --all-targets -- -D warnings
 ```
@@ -307,7 +364,8 @@ Coverage includes projection math (near maps to -1, far maps to +1),
 matrix/vector identities, mesh winding vs. normals for all generators,
 near-plane clipping, z-buffer ordering, off-screen line and triangle
 termination, Gouraud interpolation, shadow projection and single-composite
-behavior, AA resolve and SMAA edge cases, and public API usage.
+behavior, AA resolve and SMAA edge cases, banded renders matching a
+single-threaded frame, and public API usage.
 
 ## Known limitations and next steps
 

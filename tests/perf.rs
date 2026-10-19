@@ -69,24 +69,34 @@ fn bench_demo_scene() {
     let scene = demo_scene();
     let camera = Camera::new(0.6, 0.35, 8.0);
     let tris: usize = scene.objects.iter().map(|o| o.mesh.tri_count()).sum();
-    println!("demo scene: {tris} triangles, 800x800");
+    println!("demo scene: {tris} triangles");
 
-    for aa in [
-        AntiAliasing::None,
-        AntiAliasing::Msaa { factor: 2 },
-        AntiAliasing::Smaa,
+    for (label, width, height) in [
+        ("800x800", 800, 800),
+        ("1920x1080", 1920, 1080),
+        ("2560x1440", 2560, 1440),
     ] {
-        let mut r = Renderer::new(800, 800);
-        r.options.aa = aa;
-        for _ in 0..10 {
-            r.render(&scene, &camera);
+        for aa in [
+            AntiAliasing::None,
+            AntiAliasing::Msaa { factor: 2 },
+            AntiAliasing::Smaa,
+        ] {
+            let mut r = Renderer::new(width, height);
+            r.options.aa = aa;
+            for _ in 0..10 {
+                r.render(&scene, &camera);
+            }
+            let frames = 60;
+            let start = Instant::now();
+            for _ in 0..frames {
+                r.render(&scene, &camera);
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            println!(
+                "{label} {aa:?} (active {:?}): {ms:.2} ms/frame ({:.0} fps)",
+                r.active_aa(),
+                1000.0 / ms
+            );
         }
-        let frames = 60;
-        let start = Instant::now();
-        for _ in 0..frames {
-            r.render(&scene, &camera);
-        }
-        let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
-        println!("{aa:?}: {ms:.2} ms/frame ({:.0} fps)", 1000.0 / ms);
     }
 }

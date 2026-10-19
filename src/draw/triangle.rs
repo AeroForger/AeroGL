@@ -19,26 +19,104 @@ pub struct ShadedVertex {
 }
 
 /// Gouraud-shaded, z-buffered triangle: interpolates per-vertex colors and
-/// depth across the face with barycentric weights.
+/// depth across the face.
+///
+/// Depth and color are linear in screen space, so they are stepped along each
+/// scanline. Recomputing them from three barycentric weights per pixel is the
+/// obvious implementation, but it costs nine extra multiplies per pixel.
 pub fn draw_triangle_gouraud(
     target: &mut Target,
     a: ShadedVertex,
     b: ShadedVertex,
     c: ShadedVertex,
 ) {
-    rasterize(
-        target,
-        [a.x, a.y, a.z],
-        [b.x, b.y, b.z],
-        [c.x, c.y, c.z],
-        |_, w0, w1, w2| {
-            rgb(
-                a.color[0] * w0 + b.color[0] * w1 + c.color[0] * w2,
-                a.color[1] * w0 + b.color[1] * w1 + c.color[1] * w2,
-                a.color[2] * w0 + b.color[2] * w1 + c.color[2] * w2,
-            )
-        },
-    );
+    // Clamp the bounding box to the screen and then to this band. A vertex
+    // clipped at the near plane can project millions of pixels off-screen.
+    let band_start = target.band_offset() as i32;
+    let band_end = target.band_end() as i32 - 1;
+    let min_x = (a.x.min(b.x).min(c.x).floor() as i32).max(0);
+    let max_x = (a.x.max(b.x).max(c.x).ceil() as i32).min(target.width as i32 - 1);
+    // Step from the triangle's own top for the same rounding sequence in every
+    // band, so banded output matches a single-threaded render exactly.
+    let bbox_min_y = (a.y.min(b.y).min(c.y).floor() as i32).max(0);
+    let bbox_max_y = (a.y.max(b.y).max(c.y).ceil() as i32).min(target.height as i32 - 1);
+    let min_y = bbox_min_y.max(band_start);
+    let max_y = bbox_max_y.min(band_end);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let inv_area = 1.0 / area;
+
+    let px = min_x as f32 + 0.5;
+    let py = bbox_min_y as f32 + 0.5;
+    let dw0_dx = (b.y - c.y) * inv_area;
+    let dw0_dy = (c.x - b.x) * inv_area;
+    let dw1_dx = (c.y - a.y) * inv_area;
+    let dw1_dy = (a.x - c.x) * inv_area;
+    let dw2_dx = (a.y - b.y) * inv_area;
+    let dw2_dy = (b.x - a.x) * inv_area;
+    let mut w0_row = edge(b.x, b.y, c.x, c.y, px, py) * inv_area;
+    let mut w1_row = edge(c.x, c.y, a.x, a.y, px, py) * inv_area;
+    let mut w2_row = edge(a.x, a.y, b.x, b.y, px, py) * inv_area;
+
+    let dz_dx = dw0_dx * a.z + dw1_dx * b.z + dw2_dx * c.z;
+    let dr_dx = dw0_dx * a.color[0] + dw1_dx * b.color[0] + dw2_dx * c.color[0];
+    let dg_dx = dw0_dx * a.color[1] + dw1_dx * b.color[1] + dw2_dx * c.color[1];
+    let db_dx = dw0_dx * a.color[2] + dw1_dx * b.color[2] + dw2_dx * c.color[2];
+
+    let width = target.width;
+    let color = &mut target.color[..];
+    let depth = &mut target.depth[..];
+
+    for y in bbox_min_y..=bbox_max_y {
+        if !(band_start..=band_end).contains(&y) {
+            w0_row += dw0_dy;
+            w1_row += dw1_dy;
+            w2_row += dw2_dy;
+            continue;
+        }
+        let Some((lo, hi)) = row_span(
+            [w0_row, w1_row, w2_row],
+            [dw0_dx, dw1_dx, dw2_dx],
+            min_x,
+            max_x,
+        ) else {
+            w0_row += dw0_dy;
+            w1_row += dw1_dy;
+            w2_row += dw2_dy;
+            continue;
+        };
+
+        let step = (lo - min_x) as f32;
+        let w0 = w0_row + dw0_dx * step;
+        let w1 = w1_row + dw1_dx * step;
+        let w2 = w2_row + dw2_dx * step;
+        let mut z = w0 * a.z + w1 * b.z + w2 * c.z;
+        let mut r = w0 * a.color[0] + w1 * b.color[0] + w2 * c.color[0];
+        let mut g = w0 * a.color[1] + w1 * b.color[1] + w2 * c.color[1];
+        let mut bl = w0 * a.color[2] + w1 * b.color[2] + w2 * c.color[2];
+        let row = (y - band_start) as usize * width;
+        for x in lo..=hi {
+            let idx = row + x as usize;
+            // Slightly conservative epsilon avoids z-fighting on shared edges.
+            if z < depth[idx] + 1e-6 {
+                depth[idx] = z;
+                color[idx] = rgb(r, g, bl);
+            }
+            z += dz_dx;
+            r += dr_dx;
+            g += dg_dx;
+            bl += db_dx;
+        }
+        w0_row += dw0_dy;
+        w1_row += dw1_dy;
+        w2_row += dw2_dy;
+    }
 }
 
 /// Flat, single-color z-buffered triangle.
@@ -56,20 +134,27 @@ pub fn draw_triangle_z(target: &mut Target, a: [f32; 3], b: [f32; 3], c: [f32; 3
 /// triangles are all the same value. Skipping the depth buffer saves a read, a
 /// compare, and a write per pixel, and the caller does not have to clear or
 /// allocate a depth buffer at all.
+#[allow(clippy::too_many_arguments)] // band geometry plus the triangle
 pub(crate) fn draw_triangle_cover(
     color: &mut [u32],
     width: usize,
-    height: usize,
+    y_offset: usize,
+    rows: usize,
     a: [f32; 2],
     b: [f32; 2],
     c: [f32; 2],
     value: u32,
 ) {
+    let band_start = y_offset as i32;
+    let band_end = (y_offset + rows) as i32 - 1;
     let min_x = (a[0].min(b[0]).min(c[0]).floor() as i32).max(0);
     let max_x = (a[0].max(b[0]).max(c[0]).ceil() as i32).min(width as i32 - 1);
-    let min_y = (a[1].min(b[1]).min(c[1]).floor() as i32).max(0);
-    let max_y = (a[1].max(b[1]).max(c[1]).ceil() as i32).min(height as i32 - 1);
-    if min_x > max_x || min_y > max_y {
+    // Step from the triangle's own top for every band, so all bands follow the
+    // same rounding sequence and coverage matches a full-screen pass exactly.
+    let bbox_min_y = (a[1].min(b[1]).min(c[1]).floor() as i32).max(0);
+    let bbox_max_y = (a[1].max(b[1]).max(c[1]).ceil() as i32).min(band_end);
+    let min_y = bbox_min_y.max(band_start);
+    if min_x > max_x || min_y > bbox_max_y {
         return;
     }
 
@@ -80,7 +165,7 @@ pub(crate) fn draw_triangle_cover(
     let inv_area = 1.0 / area;
 
     let px = min_x as f32 + 0.5;
-    let py = min_y as f32 + 0.5;
+    let py = bbox_min_y as f32 + 0.5;
     let dw0_dx = (b[1] - c[1]) * inv_area;
     let dw0_dy = (c[0] - b[0]) * inv_area;
     let dw1_dx = (c[1] - a[1]) * inv_area;
@@ -91,19 +176,22 @@ pub(crate) fn draw_triangle_cover(
     let mut w1_row = edge(c[0], c[1], a[0], a[1], px, py) * inv_area;
     let mut w2_row = edge(a[0], a[1], b[0], b[1], px, py) * inv_area;
 
-    for y in min_y..=max_y {
+    for y in bbox_min_y..=bbox_max_y {
         // The inside region of a triangle on one scanline is a single interval.
         // Solve each edge for the x range where its weight is >= -epsilon, then
         // fill the whole span in one go. This skips the per-pixel edge tests
         // and stores, which is most of the cost for large shadow triangles.
-        if let Some((lo, hi)) = row_span(
-            [w0_row, w1_row, w2_row],
-            [dw0_dx, dw1_dx, dw2_dx],
-            min_x,
-            max_x,
-        ) {
-            let start = y as usize * width + lo as usize;
-            let end = y as usize * width + hi as usize;
+        if y >= band_start
+            && let Some((lo, hi)) = row_span(
+                [w0_row, w1_row, w2_row],
+                [dw0_dx, dw1_dx, dw2_dx],
+                min_x,
+                max_x,
+            )
+        {
+            let row = (y - band_start) as usize * width;
+            let start = row + lo as usize;
+            let end = row + hi as usize;
             color[start..=end].fill(value);
         }
         w0_row += dw0_dy;
@@ -165,15 +253,23 @@ fn rasterize<F>(target: &mut Target, a: [f32; 3], b: [f32; 3], c: [f32; 3], shad
 where
     F: Fn(u32, f32, f32, f32) -> u32,
 {
-    // Clamp the bounding box to the screen *before* looping. A vertex clipped
-    // at the near plane can project millions of pixels off-screen; without
-    // this the per-pixel loop would walk that whole range.
+    // Clamp the bounding box to the screen and then to this band. A vertex
+    // clipped at the near plane can project millions of pixels off-screen;
+    // without this the per-pixel loop would walk that whole range.
+    let band_start = target.band_offset() as i32;
+    let band_end = target.band_end() as i32 - 1;
     let min_x = (a[0].min(b[0]).min(c[0]).floor() as i32).max(0);
     let max_x = (a[0].max(b[0]).max(c[0]).ceil() as i32).min(target.width as i32 - 1);
-    let min_y = (a[1].min(b[1]).min(c[1]).floor() as i32).max(0);
-    let max_y = (a[1].max(b[1]).max(c[1]).ceil() as i32).min(target.height as i32 - 1);
+    // Step weights from the triangle's own top, not from the band's top. Every
+    // band then walks the same sequence of rounding steps, so a banded render
+    // is pixel-identical to a single-threaded one. Rows outside the band are
+    // skipped but still stepped, which is a few adds per row.
+    let bbox_min_y = (a[1].min(b[1]).min(c[1]).floor() as i32).max(0);
+    let bbox_max_y = (a[1].max(b[1]).max(c[1]).ceil() as i32).min(target.height as i32 - 1);
+    let min_y = bbox_min_y.max(band_start);
+    let max_y = bbox_max_y.min(band_end);
     if min_x > max_x || min_y > max_y {
-        return; // completely off-screen
+        return; // completely outside this band
     }
 
     // Twice the signed area. This is also the barycentric denominator.
@@ -186,7 +282,7 @@ where
     // Edge functions at the first pixel center, plus their per-step deltas.
     // w0 is the weight of a, w1 of b, w2 of c.
     let px = min_x as f32 + 0.5;
-    let py = min_y as f32 + 0.5;
+    let py = bbox_min_y as f32 + 0.5;
     let dw0_dx = (b[1] - c[1]) * inv_area;
     let dw0_dy = (c[0] - b[0]) * inv_area;
     let dw1_dx = (c[1] - a[1]) * inv_area;
@@ -204,7 +300,13 @@ where
     let color = &mut target.color[..];
     let depth = &mut target.depth[..];
 
-    for y in min_y..=max_y {
+    for y in bbox_min_y..=bbox_max_y {
+        if !(band_start..=band_end).contains(&y) {
+            w0_row += dw0_dy;
+            w1_row += dw1_dy;
+            w2_row += dw2_dy;
+            continue;
+        }
         let Some((lo, hi)) = row_span(
             [w0_row, w1_row, w2_row],
             [dw0_dx, dw1_dx, dw2_dx],
@@ -222,7 +324,7 @@ where
         let mut w1 = w1_row + dw1_dx * step;
         let mut w2 = w2_row + dw2_dx * step;
         let mut z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-        let row = y as usize * width;
+        let row = (y - band_start) as usize * width;
         for x in lo..=hi {
             let idx = row + x as usize;
             // Slightly conservative epsilon avoids z-fighting on shared edges.

@@ -4,7 +4,7 @@
 use crate::aa::{AntiAliasing, SmaaScratch, apply_smaa_with_scratch, resolve_downsample};
 use crate::camera::Camera;
 use crate::framebuffer::Framebuffer;
-use crate::pipeline::{ShadowMask, render_scene};
+use crate::pipeline::{ShadowMask, render_scene_clear};
 use crate::scene::Scene;
 
 /// Options that affect how a frame is produced.
@@ -14,6 +14,14 @@ pub struct RenderOptions {
     pub aa: AntiAliasing,
     /// Background clear color, packed `0x00RRGGBB`.
     pub background: u32,
+    /// Largest supersampled frame, in pixels, before [`AntiAliasing::Msaa`]
+    /// falls back to [`AntiAliasing::Smaa`].
+    ///
+    /// Supersampling costs scale with the square of the factor, so a 2x buffer
+    /// at 1440p is four times the pixels of the window. That is fine for a
+    /// still frame but can halve the frame rate. The default cap is a 4K
+    /// buffer; set this to `None` to let MSAA use whatever the mode asks for.
+    pub max_internal_pixels: Option<usize>,
 }
 
 impl Default for RenderOptions {
@@ -21,6 +29,9 @@ impl Default for RenderOptions {
         Self {
             aa: AntiAliasing::None,
             background: 0x001A_2B3C,
+            // One 4K frame. MSAA is still available at ordinary window sizes,
+            // but a 1440p or 4K window falls back to the cheaper SMAA pass.
+            max_internal_pixels: Some(4_000_000),
         }
     }
 }
@@ -88,17 +99,23 @@ impl Renderer {
     ///
     /// The slice is valid until the next [`Renderer::render`] call.
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> &[u32] {
-        let scale = self.options.aa.scale() as usize;
+        let aa = self.active_aa();
+        let scale = aa.scale() as usize;
         if scale == 1 {
             // No supersampling: render directly into the output framebuffer.
             // This avoids copying the whole image through `internal` first.
             self.output.resize(self.width, self.height);
-            self.output.clear(self.options.background);
             {
                 let mut target = self.output.target();
-                render_scene(&mut target, scene, camera, &mut self.shadow);
+                render_scene_clear(
+                    &mut target,
+                    scene,
+                    camera,
+                    &mut self.shadow,
+                    self.options.background,
+                );
             }
-            if self.options.aa == AntiAliasing::Smaa {
+            if aa == AntiAliasing::Smaa {
                 apply_smaa_with_scratch(
                     &mut self.output.color,
                     self.width,
@@ -109,10 +126,15 @@ impl Renderer {
         } else {
             let (iw, ih) = (self.width * scale, self.height * scale);
             self.internal.resize(iw, ih);
-            self.internal.clear(self.options.background);
             {
                 let mut target = self.internal.target();
-                render_scene(&mut target, scene, camera, &mut self.shadow);
+                render_scene_clear(
+                    &mut target,
+                    scene,
+                    camera,
+                    &mut self.shadow,
+                    self.options.background,
+                );
             }
 
             self.output.resize(self.width, self.height);
@@ -125,6 +147,25 @@ impl Renderer {
             );
         }
         &self.output.color
+    }
+
+    /// The anti-aliasing mode this renderer actually uses at its current size.
+    ///
+    /// This equals [`RenderOptions::aa`] except when a requested supersampled
+    /// buffer would exceed [`RenderOptions::max_internal_pixels`]. In that case
+    /// the renderer uses SMAA instead, so a large window cannot quietly turn a
+    /// 2x request into a four-times-larger frame.
+    pub fn active_aa(&self) -> AntiAliasing {
+        let requested = self.options.aa;
+        let Some(limit) = self.options.max_internal_pixels else {
+            return requested;
+        };
+        let scale = requested.scale() as usize;
+        if scale > 1 && self.width * scale * self.height * scale > limit {
+            AntiAliasing::Smaa
+        } else {
+            requested
+        }
     }
 
     /// The last rendered pixels.
@@ -187,6 +228,105 @@ mod tests {
         r.resize(64, 16);
         let px = r.render(&test_scene(), &Camera::default());
         assert_eq!(px.len(), 64 * 16);
+    }
+
+    #[test]
+    fn oversized_msaa_falls_back_to_smaa() {
+        // 1500x1500 at 2x is 9,000,000 internal pixels, above the 4M default.
+        let mut big = Renderer::new(1500, 1500);
+        big.options.aa = AntiAliasing::Msaa { factor: 2 };
+        assert_eq!(big.active_aa(), AntiAliasing::Smaa);
+
+        big.options.max_internal_pixels = None;
+        assert_eq!(big.active_aa(), AntiAliasing::Msaa { factor: 2 });
+
+        // 500x500 at 2x is 1,000,000 pixels, so MSAA stays selected.
+        let mut small = Renderer::new(500, 500);
+        small.options.aa = AntiAliasing::Msaa { factor: 2 };
+        assert_eq!(small.active_aa(), AntiAliasing::Msaa { factor: 2 });
+        // But a 4x request at the same size is 4,000,000 and still fits.
+        small.options.aa = AntiAliasing::Msaa { factor: 4 };
+        assert_eq!(small.active_aa(), AntiAliasing::Msaa { factor: 4 });
+        // 501x501 at 4x is 4,016,016, just over the default.
+        let mut just_over = Renderer::new(501, 501);
+        just_over.options.aa = AntiAliasing::Msaa { factor: 4 };
+        assert_eq!(just_over.active_aa(), AntiAliasing::Smaa);
+    }
+
+    /// The banded pass is an optimization, not a new look. A 520x520 frame is
+    /// above the thread threshold, so this renders the same scene single- and
+    /// multi-threaded and requires a pixel-for-pixel match.
+    #[test]
+    fn parallel_bands_match_single_threaded_output() {
+        use crate::math::{Mat4, Vec3};
+        use crate::parallel::set_thread_limit_for_tests;
+        use crate::scene::DrawMode;
+
+        let mut scene = Scene::new();
+        scene.add(
+            Object::new(Mesh::cube(), Material::new([0.9, 0.3, 0.2]))
+                .with_transform(Mat4::translation(Vec3::new(-1.2, -0.3, 0.0))),
+        );
+        scene.add(
+            Object::new(
+                Mesh::torus(20, 10, 0.9, 0.35),
+                Material::new([0.3, 0.7, 1.0]).with_specular(0.6, 64.0),
+            )
+            .with_transform(Mat4::translation(Vec3::new(1.1, 0.5, 0.0))),
+        );
+        scene.add(
+            Object::new(Mesh::sphere(12, 18), Material::new([0.8, 0.8, 0.9]))
+                .with_mode(DrawMode::Wireframe)
+                .with_transform(Mat4::translation(Vec3::new(0.0, 0.6, 2.0))),
+        );
+        let camera = Camera::new(0.6, 0.35, 8.0);
+
+        set_thread_limit_for_tests(1);
+        let mut one = Renderer::new(520, 520);
+        one.options.aa = AntiAliasing::None;
+        let serial = one.render(&scene, &camera).to_vec();
+
+        set_thread_limit_for_tests(8);
+        let mut many = Renderer::new(520, 520);
+        many.options.aa = AntiAliasing::None;
+        let parallel = many.render(&scene, &camera).to_vec();
+        set_thread_limit_for_tests(0);
+
+        assert_eq!(
+            serial, parallel,
+            "banded render must match single-threaded render"
+        );
+    }
+
+    /// The clear, downsample and SMAA passes also split across threads. Check
+    /// that each AA mode gives the same pixels at one and many workers.
+    #[test]
+    fn parallel_aa_matches_single_threaded_output() {
+        use crate::parallel::set_thread_limit_for_tests;
+
+        let scene = test_scene();
+        let camera = Camera::default();
+
+        for aa in [
+            AntiAliasing::Smaa,
+            AntiAliasing::Msaa { factor: 2 },
+            AntiAliasing::Msaa { factor: 4 },
+        ] {
+            set_thread_limit_for_tests(1);
+            let mut one = Renderer::new(700, 700);
+            one.options.aa = aa;
+            one.options.max_internal_pixels = None;
+            let serial = one.render(&scene, &camera).to_vec();
+
+            set_thread_limit_for_tests(8);
+            let mut many = Renderer::new(700, 700);
+            many.options.aa = aa;
+            many.options.max_internal_pixels = None;
+            let parallel = many.render(&scene, &camera).to_vec();
+            set_thread_limit_for_tests(0);
+
+            assert_eq!(serial, parallel, "{aa:?} differs across thread counts");
+        }
     }
 
     /// Frame-time probe (not run by default):

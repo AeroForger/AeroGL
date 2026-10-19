@@ -169,11 +169,17 @@ fn main() {
         title_timer += dt;
         if title_timer >= 0.25 {
             title_timer = 0.0;
-            let aa = app.renderer().options.aa;
+            let selected = app.renderer().options.aa;
+            let active = app.renderer().active_aa();
+            let aa_text = if active == selected {
+                aa_label(selected)
+            } else {
+                format!("{} (capped from {})", aa_label(active), aa_label(selected))
+            };
             app.set_title(&format!(
                 "AeroGL - {}, {} | {} tris | {:.0} fps | C mode, A AA, G grid, S shadows",
                 mode_label(RENDER_MODES[mode]),
-                aa_label(aa),
+                aa_text,
                 scene
                     .objects
                     .iter()

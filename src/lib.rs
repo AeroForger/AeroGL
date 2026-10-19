@@ -55,6 +55,7 @@ pub mod window;
 mod aa;
 mod light;
 mod material;
+mod parallel;
 
 pub use aa::AntiAliasing;
 pub use camera::Camera;
