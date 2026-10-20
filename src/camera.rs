@@ -54,8 +54,32 @@ impl Camera {
     }
 
     /// Projection matrix for the given aspect ratio (`width / height`).
+    ///
+    /// Degenerate fields are sanitized instead of producing NaNs: a non-finite
+    /// or non-positive aspect becomes `1.0`, the FOV is clamped to
+    /// `(1, 179)` degrees, and near/far fall back to sane values.
     pub fn projection(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective(self.fov_y_deg.to_radians(), aspect, self.near, self.far)
+        let aspect = if aspect.is_finite() && aspect > 1e-6 {
+            aspect
+        } else {
+            1.0
+        };
+        let near = if self.near.is_finite() && self.near > 1e-4 {
+            self.near
+        } else {
+            0.1
+        };
+        let far = if self.far.is_finite() && self.far > near + 1e-3 {
+            self.far
+        } else {
+            near + 100.0
+        };
+        let fov_y_deg = if self.fov_y_deg.is_finite() {
+            self.fov_y_deg.clamp(1.0, 179.0)
+        } else {
+            65.0
+        };
+        Mat4::perspective(fov_y_deg.to_radians(), aspect, near, far)
     }
 
     /// Applies a mouse drag delta in pixels.
@@ -99,5 +123,17 @@ mod tests {
             (cam.distance - 1.5).abs() < 1e-4,
             "zoom clamps at near limit"
         );
+    }
+
+    #[test]
+    fn projection_sanitizes_degenerate_fields() {
+        let cam = Camera {
+            fov_y_deg: 0.0,
+            near: 0.0,
+            far: 0.0,
+            ..Camera::default()
+        };
+        let m = cam.projection(0.0);
+        assert!(m.m.iter().flatten().all(|v| v.is_finite()), "{:?}", m.m);
     }
 }

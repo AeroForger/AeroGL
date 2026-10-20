@@ -65,18 +65,18 @@ mod parallel;
 
 pub use aa::AntiAliasing;
 pub use camera::Camera;
-pub use framebuffer::{Framebuffer, Target};
+pub use framebuffer::{Framebuffer, FramebufferError, Target};
 pub use light::{DirectionalLight, Light, PointLight, SpotLight};
 pub use material::Material;
 pub use math::{Mat4, Vec3};
-pub use mesh::{Mesh, Vertex};
+pub use mesh::{Mesh, MeshError, Vertex};
 pub use obj::ObjError;
-pub use pipeline::RenderContext;
+pub use pipeline::{RenderContext, SceneRender};
 pub use post::{PostProcess, ToneMapping};
 pub use renderer::{RenderOptions, Renderer};
 pub use scene::{DrawMode, Fog, Ground, Object, Scene};
 pub use shadow_map::{ShadowMap, ShadowSettings};
-pub use texture::{Texture, WrapMode};
+pub use texture::{Texture, TextureError, WrapMode};
 
 #[cfg(feature = "window")]
 pub use window::AeroglWindow;

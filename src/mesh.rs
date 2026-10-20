@@ -2,6 +2,58 @@
 //! Made by AeroForger
 
 use crate::math::Vec3;
+use std::fmt;
+
+/// A problem with a mesh's vertex or index data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MeshError {
+    /// The index buffer is not a whole number of triangles.
+    IncompleteTriangle {
+        /// Number of entries in the index buffer.
+        index_count: usize,
+    },
+    /// A triangle references a vertex that does not exist.
+    IndexOutOfRange {
+        /// Zero-based triangle number.
+        triangle: usize,
+        /// The bad index.
+        index: u32,
+        /// Number of vertices in the mesh.
+        vertex_count: usize,
+    },
+    /// A vertex position, normal, or UV contains NaN or infinity.
+    NonFiniteVertex {
+        /// Zero-based vertex number.
+        vertex: usize,
+    },
+}
+
+impl fmt::Display for MeshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteTriangle { index_count } => write!(
+                f,
+                "index buffer has {index_count} entries; a mesh needs a multiple of 3"
+            ),
+            Self::IndexOutOfRange {
+                triangle,
+                index,
+                vertex_count,
+            } => write!(
+                f,
+                "triangle {triangle} uses vertex index {index}, but the mesh has {vertex_count} vertices"
+            ),
+            Self::NonFiniteVertex { vertex } => {
+                write!(
+                    f,
+                    "vertex {vertex} has a non-finite position, normal, or UV"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MeshError {}
 
 /// A single mesh vertex: model-space position, normal, and texture coordinate.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,8 +96,51 @@ pub struct Mesh {
 
 impl Mesh {
     /// Builds a mesh from raw vertex and index buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Mesh::validate`] rejects the data. Use [`Mesh::try_new`] for
+    /// a recoverable error.
     pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
-        Self { vertices, indices }
+        Self::try_new(vertices, indices).unwrap_or_else(|error| panic!("invalid mesh: {error}"))
+    }
+
+    /// Builds a mesh, returning an error instead of panicking on bad data.
+    pub fn try_new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Result<Self, MeshError> {
+        let mesh = Self { vertices, indices };
+        mesh.validate()?;
+        Ok(mesh)
+    }
+
+    /// Checks that indices form whole triangles, point at real vertices, and
+    /// that every vertex component is finite.
+    pub fn validate(&self) -> Result<(), MeshError> {
+        if !self.indices.len().is_multiple_of(3) {
+            return Err(MeshError::IncompleteTriangle {
+                index_count: self.indices.len(),
+            });
+        }
+        for (triangle, tri) in self.indices.as_chunks::<3>().0.iter().enumerate() {
+            for &index in tri {
+                if index as usize >= self.vertices.len() {
+                    return Err(MeshError::IndexOutOfRange {
+                        triangle,
+                        index,
+                        vertex_count: self.vertices.len(),
+                    });
+                }
+            }
+        }
+        for (vertex, v) in self.vertices.iter().enumerate() {
+            if !is_finite(v.pos)
+                || !is_finite(v.normal)
+                || !v.uv[0].is_finite()
+                || !v.uv[1].is_finite()
+            {
+                return Err(MeshError::NonFiniteVertex { vertex });
+            }
+        }
+        Ok(())
     }
 
     /// Raw triangle soup: every group of 3 vertices becomes a face with its
@@ -54,7 +149,14 @@ impl Mesh {
         let mut vertices = Vec::with_capacity(tris.len() * 3);
         let mut indices = Vec::with_capacity(tris.len() * 3);
         for (a, b, c) in tris {
-            let n = b.sub(*a).cross(c.sub(*a)).normalize();
+            let cross = b.sub(*a).cross(c.sub(*a));
+            let n = if cross.length() > 1e-12 {
+                cross.normalize()
+            } else {
+                // A zero-area triangle cannot be seen from any side. Keep it
+                // with a usable normal so the data stays valid.
+                Vec3::new(0.0, 1.0, 0.0)
+            };
             let base = vertices.len() as u32;
             indices.extend([base, base + 1, base + 2]);
             vertices.push(Vertex::new(*a, n));
@@ -121,11 +223,16 @@ impl Mesh {
             mesh.indices
                 .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        mesh
+        Mesh::new(mesh.vertices, mesh.indices)
     }
 
     /// UV sphere centered at the origin, radius 1.
+    ///
+    /// `stacks` and `slices` are clamped to the smallest values that still make
+    /// a closed sphere.
     pub fn sphere(stacks: usize, slices: usize) -> Mesh {
+        let stacks = stacks.max(2);
+        let slices = slices.max(3);
         let mut mesh = Mesh::default();
         for i in 0..=stacks {
             let theta = std::f32::consts::PI * i as f32 / stacks as f32;
@@ -153,12 +260,20 @@ impl Mesh {
                 }
             }
         }
-        mesh
+        Mesh::new(mesh.vertices, mesh.indices)
     }
 
     /// Torus centered at the origin: major radius `big_r`, minor radius
     /// `small_r`, lying flat in the XZ plane.
+    ///
+    /// Segment counts are clamped to at least 3.
     pub fn torus(major: usize, minor: usize, big_r: f32, small_r: f32) -> Mesh {
+        assert!(
+            big_r.is_finite() && small_r.is_finite(),
+            "torus radii must be finite"
+        );
+        let major = major.max(3);
+        let minor = minor.max(3);
         let mut mesh = Mesh::default();
         for i in 0..=major {
             let u = 2.0 * std::f32::consts::PI * i as f32 / major as f32;
@@ -184,7 +299,7 @@ impl Mesh {
                 mesh.indices.extend([b, d, c]);
             }
         }
-        mesh
+        Mesh::new(mesh.vertices, mesh.indices)
     }
 
     /// Flat, upward-facing plane centered at the origin in the XZ plane.
@@ -195,6 +310,7 @@ impl Mesh {
     /// vertices to show local point lights and shadow-map shading across a
     /// floor.
     pub fn plane(size: f32, subdivisions: usize) -> Mesh {
+        assert!(size.is_finite(), "plane size must be finite");
         let n = subdivisions.max(1);
         let half = size * 0.5;
         let mut mesh = Mesh::default();
@@ -218,7 +334,7 @@ impl Mesh {
                 mesh.indices.extend([a, b, c, a, c, d]);
             }
         }
-        mesh
+        Mesh::new(mesh.vertices, mesh.indices)
     }
 
     /// Number of triangles in the index buffer.
@@ -264,6 +380,10 @@ impl Mesh {
             None => Vec3::ZERO,
         }
     }
+}
+
+fn is_finite(v: Vec3) -> bool {
+    v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
 #[cfg(test)]
@@ -361,5 +481,52 @@ mod tests {
                     .all(|v| v.uv[0].is_finite() && v.uv[1].is_finite())
             );
         }
+    }
+
+    #[test]
+    fn try_new_reports_incomplete_and_out_of_range_indices() {
+        let v = vec![Vertex::new(Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0))];
+        assert!(matches!(
+            Mesh::try_new(v.clone(), vec![0, 0]),
+            Err(MeshError::IncompleteTriangle { index_count: 2 })
+        ));
+        assert!(matches!(
+            Mesh::try_new(v, vec![0, 0, 1]),
+            Err(MeshError::IndexOutOfRange {
+                triangle: 0,
+                index: 1,
+                vertex_count: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn try_new_reports_non_finite_vertices() {
+        let v = vec![Vertex::new(
+            Vec3::new(f32::NAN, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        )];
+        assert!(matches!(
+            Mesh::try_new(v, vec![0, 0, 0]),
+            Err(MeshError::NonFiniteVertex { vertex: 0 })
+        ));
+    }
+
+    #[test]
+    fn zero_segment_generators_still_make_finite_geometry() {
+        for mesh in [Mesh::sphere(0, 0), Mesh::torus(0, 0, 1.0, 0.3)] {
+            assert!(mesh.tri_count() > 0);
+            assert!(mesh.validate().is_ok());
+            assert!(mesh.vertices.iter().all(|v| is_finite(v.pos)));
+        }
+    }
+
+    #[test]
+    fn degenerate_triangle_soup_gets_a_fallback_normal() {
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        let mesh = Mesh::from_triangles(&[(p, p, p)]);
+        assert_eq!(mesh.tri_count(), 1);
+        assert!(mesh.validate().is_ok());
+        assert!(mesh.vertices[0].normal.length() > 0.99);
     }
 }

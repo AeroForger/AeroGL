@@ -10,8 +10,13 @@ mod object;
 mod shade;
 mod shadow;
 
-pub use frame::{render_scene, render_scene_clear, render_scene_clear_with_shadow_map};
+pub use frame::{
+    SceneRender, render_scene, render_scene_clear, render_scene_clear_with_shadow_map,
+    render_scene_with,
+};
 pub use grid::draw_grid;
 pub use object::render_object;
 pub use shade::{RenderContext, ResolvedLight, shade_vertex};
-pub use shadow::{ShadowMask, composite_shadow, project_to_plane, render_shadow_into};
+pub use shadow::{
+    ShadowMask, composite_shadow, project_to_plane, render_shadow_into, try_project_to_plane,
+};

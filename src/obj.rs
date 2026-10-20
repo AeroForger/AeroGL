@@ -140,10 +140,7 @@ pub(crate) fn parse(source: &str) -> Result<Mesh, ObjError> {
 
     // Generate smooth normals for faces that did not supply any.
     if needs_normal.iter().any(|&n| n) {
-        for tri in mesh.indices.chunks(3) {
-            if tri.len() < 3 {
-                continue;
-            }
+        for tri in mesh.indices.as_chunks::<3>().0 {
             let a = mesh.vertices[tri[0] as usize].pos;
             let b = mesh.vertices[tri[1] as usize].pos;
             let c = mesh.vertices[tri[2] as usize].pos;
@@ -164,6 +161,8 @@ pub(crate) fn parse(source: &str) -> Result<Mesh, ObjError> {
         }
     }
 
+    mesh.validate()
+        .map_err(|error| ObjError::at(0, error.to_string()))?;
     Ok(mesh)
 }
 

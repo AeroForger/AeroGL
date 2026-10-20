@@ -2,6 +2,38 @@
 //! Made by AeroForger
 
 use crate::draw::rgb;
+use std::fmt;
+
+/// A problem while building a [`Texture`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextureError {
+    /// One or both dimensions are zero.
+    ZeroDimension,
+    /// `width * height` overflows `usize`.
+    SizeOverflow,
+    /// The pixel buffer is not `width * height` long.
+    PixelCountMismatch {
+        /// Number of pixels the dimensions require.
+        expected: usize,
+        /// Number of pixels supplied.
+        actual: usize,
+    },
+}
+
+impl fmt::Display for TextureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroDimension => write!(f, "texture needs a positive width and height"),
+            Self::SizeOverflow => write!(f, "texture dimensions overflow usize"),
+            Self::PixelCountMismatch { expected, actual } => write!(
+                f,
+                "texture has {actual} pixels; width * height needs {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TextureError {}
 
 /// How texture coordinates outside `[0,1]` are resolved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,24 +69,57 @@ impl Texture {
     ///
     /// Panics if `pixels.len() != width * height` or either dimension is zero.
     pub fn new(width: usize, height: usize, pixels: Vec<u32>) -> Self {
-        assert!(width > 0 && height > 0, "texture needs a positive size");
-        assert_eq!(
-            pixels.len(),
-            width * height,
-            "texture pixels must be width * height"
-        );
-        Self {
+        Self::try_new(width, height, pixels)
+            .unwrap_or_else(|error| panic!("invalid texture: {error}"))
+    }
+
+    /// Builds a texture, returning an error instead of panicking on bad data.
+    pub fn try_new(width: usize, height: usize, pixels: Vec<u32>) -> Result<Self, TextureError> {
+        if width == 0 || height == 0 {
+            return Err(TextureError::ZeroDimension);
+        }
+        let expected = width
+            .checked_mul(height)
+            .ok_or(TextureError::SizeOverflow)?;
+        if pixels.len() != expected {
+            return Err(TextureError::PixelCountMismatch {
+                expected,
+                actual: pixels.len(),
+            });
+        }
+        Ok(Self {
             width,
             height,
             pixels,
             wrap: WrapMode::Repeat,
-        }
+        })
     }
 
     /// Builds a texture by calling `f(u, v)` for every texel, with `u` and `v`
     /// at texel centers in `[0,1)`.
-    pub fn from_fn(width: usize, height: usize, mut f: impl FnMut(f32, f32) -> [f32; 3]) -> Self {
-        let mut pixels = Vec::with_capacity(width * height);
+    ///
+    /// # Panics
+    ///
+    /// Panics if either dimension is zero or the total size overflows. Use
+    /// [`Texture::try_from_fn`] for a recoverable error.
+    pub fn from_fn(width: usize, height: usize, f: impl FnMut(f32, f32) -> [f32; 3]) -> Self {
+        Self::try_from_fn(width, height, f)
+            .unwrap_or_else(|error| panic!("invalid texture: {error}"))
+    }
+
+    /// Like [`Texture::from_fn`], but reports an error instead of panicking.
+    pub fn try_from_fn(
+        width: usize,
+        height: usize,
+        mut f: impl FnMut(f32, f32) -> [f32; 3],
+    ) -> Result<Self, TextureError> {
+        if width == 0 || height == 0 {
+            return Err(TextureError::ZeroDimension);
+        }
+        let len = width
+            .checked_mul(height)
+            .ok_or(TextureError::SizeOverflow)?;
+        let mut pixels = Vec::with_capacity(len);
         for y in 0..height {
             for x in 0..width {
                 let u = (x as f32 + 0.5) / width as f32;
@@ -63,18 +128,44 @@ impl Texture {
                 pixels.push(rgb(r, g, b));
             }
         }
-        Self::new(width, height, pixels)
+        Self::try_new(width, height, pixels)
     }
 
     /// A solid-color texture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero. Use [`Texture::try_solid`] for a recoverable
+    /// error.
     pub fn solid(size: usize, color: [f32; 3]) -> Self {
-        Self::from_fn(size, size, move |_, _| color)
+        Self::try_solid(size, color).unwrap_or_else(|error| panic!("invalid texture: {error}"))
+    }
+
+    /// A solid-color texture, returning an error for a zero size.
+    pub fn try_solid(size: usize, color: [f32; 3]) -> Result<Self, TextureError> {
+        Self::try_from_fn(size, size, move |_, _| color)
     }
 
     /// A square checkerboard with `cells` squares per side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero. Use [`Texture::try_checker`] for a recoverable
+    /// error.
     pub fn checker(size: usize, cells: usize, a: [f32; 3], b: [f32; 3]) -> Self {
+        Self::try_checker(size, cells, a, b)
+            .unwrap_or_else(|error| panic!("invalid texture: {error}"))
+    }
+
+    /// A checkerboard, returning an error for a zero size.
+    pub fn try_checker(
+        size: usize,
+        cells: usize,
+        a: [f32; 3],
+        b: [f32; 3],
+    ) -> Result<Self, TextureError> {
         let cells = cells.max(1);
-        Self::from_fn(size, size, move |u, v| {
+        Self::try_from_fn(size, size, move |u, v| {
             let x = (u * cells as f32).floor() as usize;
             let y = (v * cells as f32).floor() as usize;
             if (x + y).is_multiple_of(2) { a } else { b }
@@ -221,5 +312,32 @@ mod tests {
         let t = red_green().with_wrap(WrapMode::Mirror);
         // 1.75 maps to the mirrored x = 0.25, which is red.
         assert!(t.sample(1.75, 0.5)[0] > 0.9);
+    }
+
+    #[test]
+    fn checked_constructors_reject_bad_sizes() {
+        assert_eq!(
+            Texture::try_new(0, 2, Vec::new()),
+            Err(TextureError::ZeroDimension)
+        );
+        assert_eq!(
+            Texture::try_new(2, 2, vec![0; 3]),
+            Err(TextureError::PixelCountMismatch {
+                expected: 4,
+                actual: 3
+            })
+        );
+        assert_eq!(
+            Texture::try_new(usize::MAX, 2, Vec::new()),
+            Err(TextureError::SizeOverflow)
+        );
+        assert_eq!(
+            Texture::try_solid(0, [1.0; 3]),
+            Err(TextureError::ZeroDimension)
+        );
+        assert_eq!(
+            Texture::try_checker(0, 2, [1.0; 3], [0.0; 3]),
+            Err(TextureError::ZeroDimension)
+        );
     }
 }

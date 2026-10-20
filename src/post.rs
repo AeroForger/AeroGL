@@ -109,10 +109,22 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
     if settings.is_identity() || width == 0 || height == 0 {
         return;
     }
-    let inv_gamma = 1.0 / settings.gamma;
-    let gamma = (settings.gamma - 1.0).abs() > 1e-6;
-    let vignette = settings.vignette > 1e-6;
-    let saturation = (settings.saturation - 1.0).abs() > 1e-6;
+    let Some(len) = width.checked_mul(height) else {
+        return;
+    };
+    if pixels.len() < len {
+        return;
+    }
+
+    let exposure = finite_or(settings.exposure, 1.0).max(0.0);
+    let gamma_value = finite_or(settings.gamma, 1.0).max(0.01);
+    let saturation_value = finite_or(settings.saturation, 1.0).max(0.0);
+    let vignette_value = finite_or(settings.vignette, 0.0).clamp(0.0, 1.0);
+    let inv_gamma = 1.0 / gamma_value;
+    let gamma = (gamma_value - 1.0).abs() > 1e-6;
+    let vignette = vignette_value > 1e-6;
+    let saturation = (saturation_value - 1.0).abs() > 1e-6;
+    let exposure_changed = (exposure - 1.0).abs() > 1e-6;
     let cx = width as f32 * 0.5;
     let cy = height as f32 * 0.5;
     let max_dist = (cx * cx + cy * cy).sqrt().max(1.0);
@@ -122,9 +134,9 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
         for x in 0..width {
             let idx = y * width + x;
             let mut c = unpack(pixels[idx]);
-            let mut transformed = false;
+            let mut transformed = exposure_changed;
             for channel in &mut c {
-                *channel *= settings.exposure;
+                *channel *= exposure;
             }
             if settings.tone_mapping != ToneMapping::None {
                 for channel in &mut c {
@@ -135,20 +147,20 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
             if saturation {
                 let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
                 for channel in &mut c {
-                    *channel = luma + (*channel - luma) * settings.saturation;
+                    *channel = luma + (*channel - luma) * saturation_value;
                 }
                 transformed = true;
             }
             if vignette {
                 let dx = x as f32 + 0.5 - cx;
                 let dist = (dx * dx + dy * dy).sqrt() / max_dist;
-                let factor = 1.0 - settings.vignette * dist;
+                let factor = 1.0 - vignette_value * dist;
                 for channel in &mut c {
                     *channel *= factor;
                 }
                 transformed = true;
             }
-            if gamma || transformed || (settings.exposure - 1.0).abs() > 1e-6 {
+            if gamma || transformed {
                 for channel in &mut c {
                     *channel = channel.clamp(0.0, 1.0);
                     if gamma {
@@ -159,6 +171,10 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
             }
         }
     }
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
 }
 
 #[cfg(test)]
@@ -207,5 +223,33 @@ mod tests {
             &PostProcess::default().with_vignette(0.8),
         );
         assert!(pixels[4] > pixels[0], "center should stay brighter");
+    }
+
+    #[test]
+    fn short_buffers_are_left_alone() {
+        let mut pixels = vec![0x123456; 3];
+        let before = pixels.clone();
+        apply(
+            &mut pixels,
+            2,
+            2,
+            &PostProcess::default().with_exposure(2.0),
+        );
+        assert_eq!(pixels, before);
+    }
+
+    #[test]
+    fn invalid_public_values_do_not_produce_nans() {
+        let mut pixels = vec![0x808080];
+        let settings = PostProcess {
+            exposure: f32::NAN,
+            gamma: 0.0,
+            saturation: -2.0,
+            vignette: 99.0,
+            ..PostProcess::default()
+        };
+        apply(&mut pixels, 1, 1, &settings);
+        let [r, g, b] = unpack(pixels[0]);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
     }
 }

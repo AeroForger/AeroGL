@@ -131,10 +131,10 @@ or your own toolkit.
 | `Scene` | Objects, the primary `DirectionalLight`, extra `lights`, `Ground` settings (`grid`, `shadows`, `shadow_tint`), optional `fog`, and optional `shadow_map`. |
 | `Object` | `mesh`, `transform`, `material`, `mode`, `casts_shadow`. Builders: `with_transform`, `with_mode`, `with_shadow`. |
 | `DrawMode` | `Shaded`, `Wireframe`, `ShadedWireframe`. |
-| `Mesh` | `Mesh::new(vertices, indices)`, `Mesh::from_triangles(...)`, `cube()`, `sphere(stacks, slices)`, `torus(major, minor, big_r, small_r)`, `plane(size, subdivisions)`, `from_obj`, `load_obj`, `bounds`, `center`. |
+| `Mesh` | `Mesh::new(vertices, indices)` (validates), `Mesh::try_new(...)` / `Mesh::validate()` for recoverable errors, `Mesh::from_triangles(...)`, `cube()`, `sphere(stacks, slices)`, `torus(major, minor, big_r, small_r)`, `plane(size, subdivisions)`, `from_obj`, `load_obj`, `bounds`, `center`. |
 | `Vertex` | Position, normal, and `uv`. `Vertex::new(pos, normal)` defaults UV to `[0,0]`; `Vertex::with_uv(...)` sets it. |
 | `Material` | Base color, specular strength/exponent, rim, optional `Arc<Texture>`, `alpha`, and `emissive`. Builders: `with_texture`, `with_shared_texture`, `with_alpha`, `with_emissive`. |
-| `Texture` | Packed `0x00RRGGBB` image with bilinear `sample`, `sample_nearest`, `WrapMode` (repeat/clamp/mirror), `from_fn`, `solid`, `checker`. |
+| `Texture` | Packed `0x00RRGGBB` image with bilinear `sample`, `sample_nearest`, `WrapMode` (repeat/clamp/mirror), `from_fn`, `solid`, `checker`, plus `try_*` constructors that report bad sizes. |
 | `Light` | `Point(PointLight)` or `Spot(SpotLight)`. Add with `Scene::add_light`. |
 | `PointLight` / `SpotLight` | Position, color, intensity, range; spots add direction and inner/outer cone angles. |
 | `ShadowSettings` / `ShadowMap` | Resolution, depth bias, darkness, and PCF radius. `ShadowMap` is reusable across frames. |
@@ -142,7 +142,7 @@ or your own toolkit.
 | `PostProcess` / `ToneMapping` | Exposure, Reinhard/ACES curve, saturation, vignette, gamma. Set `Renderer::options.post`. |
 | `Camera` | Orbit camera: `yaw`, `pitch`, `distance`, `target`, `fov_y_deg`, `near`, `far`. Methods: `orbit()`, `zoom()`, `view()`, `projection(aspect)`, `eye()`. |
 | `Mat4` / `Vec3` | Math. `translation`, `rotation_x/y/z`, `scale`, `perspective`, `orthographic`, `look_at`, `transform_h`. |
-| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target with a `depth_write` switch. |
+| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target with a `depth_write` switch. `Framebuffer::try_new` reports zero or overflowing sizes. |
 | `draw` | `draw_line`, `draw_line_z`, `draw_triangle_z`, `draw_triangle_gouraud`, `draw_triangle_shaded`, `draw_triangle_shadow`, `rgb`, `lerp`. |
 | `ObjError` | Line-numbered OBJ parse/I/O failure with `Display` and `std::error::Error`. |
 
@@ -166,8 +166,14 @@ let camera = Camera::default();
 let scene = Scene::new();
 {
     let mut target = fb.target();
-    let mut shadows = aerogl::pipeline::ShadowMask::new();
-    aerogl::pipeline::render_scene(&mut target, &scene, &camera, &mut shadows);
+    // No planar shadow mask needed: SceneRender allocates one only when the
+    // scene enables ground shadows.
+    aerogl::pipeline::render_scene_with(
+        &mut target,
+        &scene,
+        &camera,
+        aerogl::pipeline::SceneRender::new().background(0x0010_1820),
+    );
 
     // ...or draw on top with the low-level primitives:
     target.set_pixel(10, 10, rgb(1.0, 0.2, 0.2));

@@ -2,8 +2,9 @@
 // through the public API only, with no window.
 
 use aerogl::{
-    AntiAliasing, Camera, DirectionalLight, DrawMode, Fog, Light, Mat4, Material, Mesh, Object,
-    PointLight, PostProcess, Renderer, Scene, ShadowSettings, Texture, ToneMapping, Vec3, Vertex,
+    AntiAliasing, Camera, DirectionalLight, DrawMode, Fog, Framebuffer, FramebufferError, Light,
+    Mat4, Material, Mesh, MeshError, Object, PointLight, PostProcess, Renderer, Scene, SceneRender,
+    ShadowSettings, Texture, TextureError, ToneMapping, Vec3, Vertex,
 };
 
 fn scene_with_cube() -> Scene {
@@ -416,6 +417,41 @@ fn post_process_grades_the_final_image() {
         plain, identity,
         "the default post process must be an identity transform"
     );
+}
+
+#[test]
+fn checked_constructors_report_bad_geometry_and_sizes() {
+    let vertex = Vertex::new(Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0));
+    assert!(matches!(
+        Mesh::try_new(vec![vertex], vec![0, 0, 1]),
+        Err(MeshError::IndexOutOfRange { .. })
+    ));
+    assert_eq!(
+        Texture::try_new(0, 1, Vec::new()).err(),
+        Some(TextureError::ZeroDimension)
+    );
+    assert_eq!(
+        Framebuffer::try_new(0, 0).err(),
+        Some(FramebufferError::ZeroDimension)
+    );
+}
+
+#[test]
+fn scene_render_options_do_not_require_a_planar_shadow_mask() {
+    let mut scene = scene_with_cube();
+    scene.ground.shadows = true;
+    let camera = Camera::default();
+    let mut fb = Framebuffer::new(48, 40);
+    {
+        let mut target = fb.target();
+        aerogl::pipeline::render_scene_with(
+            &mut target,
+            &scene,
+            &camera,
+            SceneRender::new().background(0x102030),
+        );
+    }
+    assert!(fb.color.iter().any(|&p| p != 0x102030));
 }
 
 #[test]

@@ -139,14 +139,23 @@ impl ShadowMap {
         let mvp = self.view_proj;
         for object in scene.objects.iter().filter(|o| o.casts_shadow) {
             let model_view_proj = mvp.multiply(&object.transform);
-            for tri in object.mesh.indices.chunks(3) {
-                if tri.len() < 3 {
+            debug_assert!(
+                object.mesh.indices.len().is_multiple_of(3),
+                "mesh index buffer is not a whole number of triangles"
+            );
+            for tri in object.mesh.indices.as_chunks::<3>().0 {
+                let (Some(v0), Some(v1), Some(v2)) = (
+                    object.mesh.vertices.get(tri[0] as usize),
+                    object.mesh.vertices.get(tri[1] as usize),
+                    object.mesh.vertices.get(tri[2] as usize),
+                ) else {
+                    debug_assert!(false, "mesh triangle references a missing vertex");
                     continue;
-                }
+                };
                 let p = [
-                    model_view_proj.transform_h(object.mesh.vertices[tri[0] as usize].pos),
-                    model_view_proj.transform_h(object.mesh.vertices[tri[1] as usize].pos),
-                    model_view_proj.transform_h(object.mesh.vertices[tri[2] as usize].pos),
+                    model_view_proj.transform_h(v0.pos),
+                    model_view_proj.transform_h(v1.pos),
+                    model_view_proj.transform_h(v2.pos),
                 ];
                 let mut poly = PolyZ::new(p);
                 poly = clip_z(poly, |q| q[2] + 1.0);

@@ -1,6 +1,28 @@
 //! Framebuffer and render target: the pixel + depth storage every pass writes.
 //! Made by AeroForger
 
+use std::fmt;
+
+/// A problem while allocating a [`Framebuffer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FramebufferError {
+    /// One or both dimensions are zero.
+    ZeroDimension,
+    /// `width * height` overflows `usize`.
+    SizeOverflow,
+}
+
+impl fmt::Display for FramebufferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroDimension => write!(f, "framebuffer needs a positive width and height"),
+            Self::SizeOverflow => write!(f, "framebuffer dimensions overflow usize"),
+        }
+    }
+}
+
+impl std::error::Error for FramebufferError {}
+
 /// A color + depth buffer with fixed dimensions.
 ///
 /// Colors are packed `0x00RRGGBB`. Depth is NDC depth (near = -1, far = +1),
@@ -18,24 +40,40 @@ pub struct Framebuffer {
 
 impl Framebuffer {
     /// Creates a framebuffer. Does not allocate more than `width * height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a dimension is zero or the size overflows. Use
+    /// [`Framebuffer::try_new`] for a recoverable error.
     pub fn new(width: usize, height: usize) -> Self {
-        let len = width * height;
-        Self {
+        Self::try_new(width, height).unwrap_or_else(|error| panic!("invalid framebuffer: {error}"))
+    }
+
+    /// Creates a framebuffer, returning an error for zero or overflowing sizes.
+    pub fn try_new(width: usize, height: usize) -> Result<Self, FramebufferError> {
+        let len = framebuffer_len(width, height)?;
+        Ok(Self {
             width,
             height,
             color: vec![0; len],
             depth: vec![f32::INFINITY; len],
-        }
+        })
     }
 
     /// Resizes in place if the dimensions changed (no-op otherwise).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a dimension is zero or the size overflows. The existing
+    /// buffers are left unchanged when this happens.
     pub fn resize(&mut self, width: usize, height: usize) {
         if self.width == width && self.height == height {
             return;
         }
+        let len = framebuffer_len(width, height)
+            .unwrap_or_else(|error| panic!("invalid framebuffer: {error}"));
         self.width = width;
         self.height = height;
-        let len = width * height;
         self.color.resize(len, 0);
         self.depth.resize(len, f32::INFINITY);
     }
@@ -127,7 +165,9 @@ impl<'a> Target<'a> {
         assert!(width > 0 && height > 0, "target needs a positive size");
         assert!(rows > 0, "target band needs at least one row");
         assert!(y_offset + rows <= height, "band must fit inside the screen");
-        let len = width * rows;
+        let len = width
+            .checked_mul(rows)
+            .expect("target band size overflows usize");
         assert_eq!(color.len(), len, "color buffer must be width * rows");
         assert_eq!(depth.len(), len, "depth buffer must be width * rows");
         Self {
@@ -231,6 +271,15 @@ impl<'a> Target<'a> {
     }
 }
 
+fn framebuffer_len(width: usize, height: usize) -> Result<usize, FramebufferError> {
+    if width == 0 || height == 0 {
+        return Err(FramebufferError::ZeroDimension);
+    }
+    width
+        .checked_mul(height)
+        .ok_or(FramebufferError::SizeOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +313,17 @@ mod tests {
         fb.resize(2, 2);
         assert_eq!(fb.color.len(), 4);
         assert_eq!(fb.depth.len(), 4);
+    }
+
+    #[test]
+    fn checked_new_rejects_zero_and_overflowing_sizes() {
+        assert_eq!(
+            Framebuffer::try_new(0, 4).err(),
+            Some(FramebufferError::ZeroDimension)
+        );
+        assert_eq!(
+            Framebuffer::try_new(usize::MAX, 2).err(),
+            Some(FramebufferError::SizeOverflow)
+        );
     }
 }

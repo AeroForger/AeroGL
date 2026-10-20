@@ -136,6 +136,30 @@ fn alpha_blends_with_the_existing_pixel() {
 }
 
 #[test]
+fn alpha_is_interpolated_per_vertex() {
+    let mut fb = Framebuffer::new(32, 32);
+    fb.clear(rgb(0.0, 0.0, 1.0));
+    {
+        let mut t = fb.target();
+        let v = |x, y, alpha| ShadedVertex::new(x, y, 0.0, [1.0, 0.0, 0.0]).with_alpha(alpha);
+        draw_triangle_shaded(
+            &mut t,
+            v(0.0, 0.0, 0.0),
+            v(32.0, 0.0, 1.0),
+            v(0.0, 32.0, 1.0),
+            None,
+        );
+    }
+    let [left_r, _, left_b] = unpack(fb.color[2 * 32 + 2]);
+    let [right_r, _, right_b] = unpack(fb.color[2 * 32 + 25]);
+    assert!(left_r < 0.2 && left_b > 0.8, "left {left_r} {left_b}");
+    assert!(
+        right_r > 0.75 && right_b < 0.25,
+        "right {right_r} {right_b}"
+    );
+}
+
+#[test]
 fn depth_write_can_be_disabled() {
     let mut fb = Framebuffer::new(32, 32);
     {

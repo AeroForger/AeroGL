@@ -45,9 +45,12 @@ impl ShadowMask {
     /// Resizes (if needed) and clears the mask.
     pub fn prepare(&mut self, width: usize, height: usize) {
         if self.width != width || self.height != height {
+            let len = width
+                .checked_mul(height)
+                .expect("shadow mask size overflows usize");
             self.width = width;
             self.height = height;
-            self.mask = vec![0; width * height];
+            self.mask = vec![0; len];
         } else if self.min_x <= self.max_x && self.min_y <= self.max_y {
             // Only the area touched last frame can be non-zero, so clearing
             // that box is enough. Shadows usually cover a small part of the
@@ -104,10 +107,30 @@ impl ShadowMask {
         }
     }
 
-    /// Whether a pixel index is shadowed.
+    /// Mask width in pixels, or `0` before the first [`ShadowMask::prepare`].
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Mask height in pixels, or `0` before the first [`ShadowMask::prepare`].
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Whether a raw pixel index is shadowed. Out-of-range indices are `false`.
     #[inline]
     pub fn is_shadowed(&self, idx: usize) -> bool {
-        self.mask[idx] != 0
+        self.mask.get(idx).is_some_and(|&value| value != 0)
+    }
+
+    /// Whether the pixel at `(x, y)` is shadowed. Out-of-range coordinates are
+    /// `false`.
+    #[inline]
+    pub fn is_shadowed_at(&self, x: usize, y: usize) -> bool {
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        self.is_shadowed(y * self.width + x)
     }
 
     /// Covers the whole mask with prepared screen-space triangles.
@@ -276,9 +299,25 @@ fn tint_pixel(color: u32, tables: &[[u8; 256]; 3]) -> u32 {
 }
 
 /// Projects a world point onto a horizontal plane along the light direction.
-pub fn project_to_plane(p: Vec3, plane_y: f32, light_dir: Vec3) -> Vec3 {
+///
+/// Returns `None` when the light is parallel to the plane (or the inputs are
+/// not finite), because the projection would be at infinity.
+pub fn try_project_to_plane(p: Vec3, plane_y: f32, light_dir: Vec3) -> Option<Vec3> {
+    if !plane_y.is_finite() || !light_dir.y.is_finite() || light_dir.y.abs() < 1e-4 {
+        return None;
+    }
     let t = (plane_y - p.y) / light_dir.y;
-    p + light_dir.scale(t)
+    let projected = p + light_dir.scale(t);
+    (projected.x.is_finite() && projected.y.is_finite() && projected.z.is_finite())
+        .then_some(projected)
+}
+
+/// Projects a world point onto a horizontal plane along the light direction.
+///
+/// When the light has no usable downward component, this returns `p` unchanged.
+/// Prefer [`try_project_to_plane`] when you need to detect that case.
+pub fn project_to_plane(p: Vec3, plane_y: f32, light_dir: Vec3) -> Vec3 {
+    try_project_to_plane(p, plane_y, light_dir).unwrap_or(p)
 }
 
 /// A ground-shadow triangle already projected to screen space.
@@ -307,6 +346,10 @@ pub fn render_shadow_into(
     plane_y: f32,
     light_dir: Vec3,
 ) {
+    debug_assert!(
+        mask.width > 0 && mask.height > 0,
+        "call ShadowMask::prepare before render_shadow_into"
+    );
     let (width, height) = (mask.width, mask.height);
     if width == 0 || height == 0 || light_dir.y >= -1e-3 {
         return;
@@ -344,13 +387,18 @@ fn prepare_shadow_object(
 ) {
     let model = object.transform;
 
-    for tri in object.mesh.indices.chunks(3) {
+    debug_assert!(
+        object.mesh.indices.len().is_multiple_of(3),
+        "mesh index buffer is not a whole number of triangles"
+    );
+    for tri in object.mesh.indices.as_chunks::<3>().0 {
         let project = |i: u32| -> Option<[f32; 4]> {
-            let world = model.transform_point(object.mesh.vertices[i as usize].pos);
+            let vertex = object.mesh.vertices.get(i as usize)?;
+            let world = model.transform_point(vertex.pos);
             if world.y < plane_y - 1e-4 {
                 return None; // clearly below the ground: would cast backwards
             }
-            let q = project_to_plane(world, plane_y, light_dir);
+            let q = try_project_to_plane(world, plane_y, light_dir)?;
             Some(view_proj.transform_h(q))
         };
         let (Some(a), Some(b), Some(c)) = (project(tri[0]), project(tri[1]), project(tri[2]))
@@ -459,10 +507,12 @@ fn clip_near_proj(pts: [[f32; 4]; 3], near: f32) -> Poly<[f32; 4]> {
 ///
 /// Runs once per pixel, so overlapping shadow geometry cannot stack up.
 pub fn composite_shadow(target: &mut Target, mask: &ShadowMask, tint: [f32; 3]) {
-    debug_assert!(
-        mask.mask.len() >= target.width * target.height,
-        "shadow mask must cover the full screen"
-    );
+    let Some(screen_len) = target.width.checked_mul(target.height) else {
+        return;
+    };
+    if mask.width != target.width || mask.height != target.height || mask.mask.len() < screen_len {
+        return;
+    }
     let Some((x0, y0, x1, y1)) = mask.bounds() else {
         return;
     };
@@ -534,5 +584,41 @@ mod tests {
         mask.prepare(16, 16);
         assert!(mask.mask.iter().all(|&p| p == 0), "stale shadow pixels");
         assert!(mask.bounds().is_none(), "bounds should reset each frame");
+    }
+
+    #[test]
+    fn horizontal_light_has_no_plane_projection() {
+        let p = Vec3::new(1.0, 2.0, 3.0);
+        let side = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(try_project_to_plane(p, -1.0, side), None);
+        assert_eq!(project_to_plane(p, -1.0, side), p);
+    }
+
+    #[test]
+    fn shadow_mask_accessors_are_bounds_checked() {
+        let mut mask = ShadowMask::new();
+        mask.prepare(16, 16);
+        mask.cover_triangle([0.0, 0.0], [15.0, 0.0], [0.0, 15.0]);
+        mask.include_bounds(0.0, 0.0, 15.0, 15.0);
+        assert_eq!((mask.width(), mask.height()), (16, 16));
+        assert!(mask.is_shadowed_at(2, 2));
+        assert!(!mask.is_shadowed_at(100, 100));
+        assert!(!mask.is_shadowed(usize::MAX));
+    }
+
+    #[test]
+    fn mismatched_shadow_masks_are_ignored() {
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(0x808080);
+        let before = fb.color.clone();
+        let mut mask = ShadowMask::new();
+        mask.prepare(8, 8);
+        mask.cover_triangle([0.0, 0.0], [7.0, 0.0], [0.0, 7.0]);
+        mask.include_bounds(0.0, 0.0, 7.0, 7.0);
+        {
+            let mut target = fb.target();
+            composite_shadow(&mut target, &mask, [0.5, 0.5, 0.5]);
+        }
+        assert_eq!(fb.color, before);
     }
 }

@@ -45,6 +45,11 @@ pub(super) fn prepare_object(
     } else {
         object.material.color
     };
+    let alpha = if object.material.alpha.is_finite() {
+        object.material.alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let mut out = Vec::with_capacity(object.mesh.vertices.len());
     for v in &object.mesh.vertices {
         let color = if shaded {
@@ -58,7 +63,7 @@ pub(super) fn prepare_object(
             pos: mvp.transform_h(v.pos),
             color,
             uv: v.uv,
-            alpha: object.material.alpha,
+            alpha,
         });
     }
     out
@@ -80,15 +85,20 @@ pub(super) fn render_prepared_object(
     let shaded = matches!(object.mode, DrawMode::Shaded | DrawMode::ShadedWireframe);
     let wireframe = matches!(object.mode, DrawMode::Wireframe | DrawMode::ShadedWireframe);
 
-    for tri in object.mesh.indices.chunks(3) {
-        let clipped = clip_near(
-            [
-                prepared[tri[0] as usize],
-                prepared[tri[1] as usize],
-                prepared[tri[2] as usize],
-            ],
-            near,
-        );
+    debug_assert!(
+        object.mesh.indices.len().is_multiple_of(3),
+        "mesh index buffer is not a whole number of triangles"
+    );
+    for tri in object.mesh.indices.as_chunks::<3>().0 {
+        let (Some(&p0), Some(&p1), Some(&p2)) = (
+            prepared.get(tri[0] as usize),
+            prepared.get(tri[1] as usize),
+            prepared.get(tri[2] as usize),
+        ) else {
+            debug_assert!(false, "mesh triangle references a missing vertex");
+            continue;
+        };
+        let clipped = clip_near([p0, p1, p2], near);
         if clipped.len() < 3 {
             continue;
         }

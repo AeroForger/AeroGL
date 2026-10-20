@@ -14,6 +14,43 @@ use super::shadow::{
     ScreenBounds, ShadowBand, ShadowMask, ShadowTri, composite_shadow, prepare_shadows,
 };
 
+/// Extra state for [`render_scene_with`].
+///
+/// All fields are optional. Planar shadows allocate a temporary mask when the
+/// scene enables them and no mask is supplied, and a shadow map is allocated
+/// only when [`Scene::shadow_map`] is set.
+#[derive(Default)]
+pub struct SceneRender<'a> {
+    background: Option<u32>,
+    shadow_mask: Option<&'a mut ShadowMask>,
+    shadow_map: Option<&'a mut ShadowMap>,
+}
+
+impl<'a> SceneRender<'a> {
+    /// No background clear, no caller-owned buffers.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears color to `background` before drawing.
+    pub fn background(mut self, background: u32) -> Self {
+        self.background = Some(background);
+        self
+    }
+
+    /// Reuses a caller-owned planar shadow mask.
+    pub fn shadow_mask(mut self, mask: &'a mut ShadowMask) -> Self {
+        self.shadow_mask = Some(mask);
+        self
+    }
+
+    /// Reuses a caller-owned directional shadow map.
+    pub fn shadow_map(mut self, map: &'a mut ShadowMap) -> Self {
+        self.shadow_map = Some(map);
+        self
+    }
+}
+
 /// Everything that is the same for every band: lit vertices, projected
 /// shadows and projected grid segments.
 struct PreparedFrame {
@@ -83,11 +120,12 @@ fn render_transparent(
         // Farthest first.
         db.dot(db).total_cmp(&da.dot(da))
     });
+    let previous_depth_write = target.depth_write;
     target.set_depth_write(false);
     for i in indices {
         render_prepared_object(target, &scene.objects[i], &prep.objects[i], near);
     }
-    target.set_depth_write(true);
+    target.set_depth_write(previous_depth_write);
 }
 
 /// Renders an entire scene: ground grid, planar shadows, opaque objects, then
@@ -98,7 +136,12 @@ fn render_transparent(
 /// threads. Every band owns distinct color, depth and mask rows, so no pass
 /// needs a lock. Transparent objects are drawn afterwards, back to front.
 pub fn render_scene(target: &mut Target, scene: &Scene, camera: &Camera, shadow: &mut ShadowMask) {
-    render_scene_with(target, scene, camera, shadow, None, None);
+    render_scene_with(
+        target,
+        scene,
+        camera,
+        SceneRender::new().shadow_mask(shadow),
+    );
 }
 
 /// Like [`render_scene`], but also clears color and depth per band before
@@ -113,7 +156,14 @@ pub fn render_scene_clear(
     shadow: &mut ShadowMask,
     background: u32,
 ) {
-    render_scene_with(target, scene, camera, shadow, Some(background), None);
+    render_scene_with(
+        target,
+        scene,
+        camera,
+        SceneRender::new()
+            .background(background)
+            .shadow_mask(shadow),
+    );
 }
 
 /// Like [`render_scene_clear`], but reusing a caller-owned [`ShadowMap`].
@@ -133,20 +183,38 @@ pub fn render_scene_clear_with_shadow_map(
         target,
         scene,
         camera,
-        shadow,
-        Some(background),
-        Some(shadow_map),
+        SceneRender::new()
+            .background(background)
+            .shadow_mask(shadow)
+            .shadow_map(shadow_map),
     );
 }
 
-fn render_scene_with(
+/// Renders a scene with explicit options and optional caller-owned buffers.
+///
+/// Use this instead of [`render_scene`] when you want to skip the planar shadow
+/// mask, supply a persistent [`ShadowMap`], or combine both.
+pub fn render_scene_with(
     target: &mut Target,
     scene: &Scene,
     camera: &Camera,
-    shadow: &mut ShadowMask,
-    background: Option<u32>,
-    mut shadow_map_scratch: Option<&mut ShadowMap>,
+    settings: SceneRender<'_>,
 ) {
+    let SceneRender {
+        background,
+        shadow_mask,
+        shadow_map,
+    } = settings;
+    let mut shadow_map_scratch = shadow_map;
+    let mut owned_mask;
+    let mut shadow = match shadow_mask {
+        Some(mask) => Some(mask),
+        None if scene.ground.shadows => {
+            owned_mask = ShadowMask::new();
+            Some(&mut owned_mask)
+        }
+        None => None,
+    };
     let view = camera.view();
     let proj = camera.projection(target.width as f32 / target.height as f32);
     let view_proj = proj.multiply(&view);
@@ -186,7 +254,9 @@ fn render_scene_with(
             target.clear(bg);
         }
         draw_grid_segments(target, &prep.grid);
-        if scene.ground.shadows {
+        if scene.ground.shadows
+            && let Some(shadow) = shadow.as_deref_mut()
+        {
             shadow.prepare(target.width, target.height);
             shadow.cover_tris(&prep.shadow_tris);
             shadow.adopt_bounds_f32(prep.shadow_bounds);
@@ -199,15 +269,18 @@ fn render_scene_with(
         return;
     }
 
-    if scene.ground.shadows {
+    if scene.ground.shadows
+        && let Some(shadow) = shadow.as_deref_mut()
+    {
         shadow.prepare(target.width, target.height);
     }
     let tint = scene.ground.shadow_tint;
     let bands = target.split_bands(threads);
-    let mut shadow_bands: Vec<Option<ShadowBand<'_>>> = if scene.ground.shadows {
-        shadow.split_bands(threads).into_iter().map(Some).collect()
-    } else {
-        (0..bands.len()).map(|_| None).collect()
+    let mut shadow_bands: Vec<Option<ShadowBand<'_>>> = match shadow.as_deref_mut() {
+        Some(shadow) if scene.ground.shadows => {
+            shadow.split_bands(threads).into_iter().map(Some).collect()
+        }
+        _ => (0..bands.len()).map(|_| None).collect(),
     };
     let PreparedFrame {
         objects,
@@ -236,7 +309,9 @@ fn render_scene_with(
         }
     });
 
-    if scene.ground.shadows {
+    if scene.ground.shadows
+        && let Some(shadow) = shadow
+    {
         shadow.adopt_bounds_f32(*shadow_bounds);
     }
 
@@ -300,5 +375,58 @@ mod tests {
         let g = Ground::default();
         assert!(g.shadows, "shadows on by default");
         assert!(g.grid, "grid on by default");
+    }
+
+    #[test]
+    fn transparent_pass_preserves_depth_write_state() {
+        let mut scene = Scene::new();
+        scene.ground.shadows = false;
+        scene.ground.grid = false;
+        scene.add(Object::new(
+            crate::mesh::Mesh::cube(),
+            Material::new([1.0, 0.0, 0.0]).with_alpha(0.4),
+        ));
+        let camera = Camera::default();
+        let mut fb = Framebuffer::new(32, 32);
+        let mut mask = ShadowMask::new();
+        let mut target = fb.target();
+        target.set_depth_write(false);
+        render_scene_clear(&mut target, &scene, &camera, &mut mask, 0);
+        assert!(
+            !target.depth_write,
+            "the transparent pass must restore the caller's state"
+        );
+    }
+
+    #[test]
+    fn render_scene_with_can_allocate_a_temporary_shadow_mask() {
+        let (width, height) = (48, 40);
+        let background = 0x102030;
+        let camera = Camera::default();
+        let mut scene = Scene::new();
+        scene.add(Object::new(
+            crate::mesh::Mesh::cube(),
+            Material::new([0.9, 0.4, 0.2]),
+        ));
+
+        let mut with_mask = Framebuffer::new(width, height);
+        let mut mask = ShadowMask::new();
+        {
+            let mut target = with_mask.target();
+            render_scene_clear(&mut target, &scene, &camera, &mut mask, background);
+        }
+
+        let mut with_temporary = Framebuffer::new(width, height);
+        {
+            let mut target = with_temporary.target();
+            render_scene_with(
+                &mut target,
+                &scene,
+                &camera,
+                SceneRender::new().background(background),
+            );
+        }
+
+        assert_eq!(with_mask.color, with_temporary.color);
     }
 }

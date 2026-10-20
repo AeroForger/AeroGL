@@ -140,6 +140,7 @@ pub fn draw_triangle_shaded(
         [b.color[0] * iw[1], b.color[1] * iw[1], b.color[2] * iw[1]],
         [c.color[0] * iw[2], c.color[1] * iw[2], c.color[2] * iw[2]],
     ];
+    let aw = [a.alpha * iw[0], b.alpha * iw[1], c.alpha * iw[2]];
 
     let mut d_iw_dx = 0.0;
     let mut d_u_dx = 0.0;
@@ -147,12 +148,14 @@ pub fn draw_triangle_shaded(
     let mut d_r_dx = 0.0;
     let mut d_g_dx = 0.0;
     let mut d_b_dx = 0.0;
+    let mut d_a_dx = 0.0;
     let mut d_iw_dy = 0.0;
     let mut d_u_dy = 0.0;
     let mut d_v_dy = 0.0;
     let mut d_r_dy = 0.0;
     let mut d_g_dy = 0.0;
     let mut d_b_dy = 0.0;
+    let mut d_a_dy = 0.0;
     for i in 0..3 {
         let (dx, dy) = [(dw0_dx, dw0_dy), (dw1_dx, dw1_dy), (dw2_dx, dw2_dy)][i];
         d_iw_dx += dx * iw[i];
@@ -167,6 +170,8 @@ pub fn draw_triangle_shaded(
         d_g_dy += dy * cw[i][1];
         d_b_dx += dx * cw[i][2];
         d_b_dy += dy * cw[i][2];
+        d_a_dx += dx * aw[i];
+        d_a_dy += dy * aw[i];
     }
 
     let dz_dx = dw0_dx * a.z + dw1_dx * b.z + dw2_dx * c.z;
@@ -176,9 +181,8 @@ pub fn draw_triangle_shaded(
     let mut r_row = w0_row * cw[0][0] + w1_row * cw[1][0] + w2_row * cw[2][0];
     let mut g_row = w0_row * cw[0][1] + w1_row * cw[1][1] + w2_row * cw[2][1];
     let mut b_row = w0_row * cw[0][2] + w1_row * cw[1][2] + w2_row * cw[2][2];
+    let mut a_row = w0_row * aw[0] + w1_row * aw[1] + w2_row * aw[2];
 
-    let alpha = a.alpha.clamp(0.0, 1.0);
-    let blend = alpha < 0.999;
     let depth_write = target.depth_write;
     let width = target.width;
     let color = &mut target.color[..];
@@ -196,8 +200,9 @@ pub fn draw_triangle_shaded(
                     &mut r_row,
                     &mut g_row,
                     &mut b_row,
+                    &mut a_row,
                 ],
-                [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy],
+                [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy, d_a_dy],
             );
             continue;
         }
@@ -217,8 +222,9 @@ pub fn draw_triangle_shaded(
                     &mut r_row,
                     &mut g_row,
                     &mut b_row,
+                    &mut a_row,
                 ],
-                [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy],
+                [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy, d_a_dy],
             );
             continue;
         };
@@ -233,6 +239,7 @@ pub fn draw_triangle_shaded(
         let mut r = r_row + d_r_dx * step;
         let mut g = g_row + d_g_dx * step;
         let mut b = b_row + d_b_dx * step;
+        let mut alpha_w = a_row + d_a_dx * step;
 
         let row = (y - band_start) as usize * width;
         for x in lo..=hi {
@@ -245,7 +252,8 @@ pub fn draw_triangle_shaded(
                     let texel = texture.sample(u / w, v / w);
                     out = [out[0] * texel[0], out[1] * texel[1], out[2] * texel[2]];
                 }
-                color[idx] = if blend {
+                let alpha = (alpha_w / w).clamp(0.0, 1.0);
+                color[idx] = if alpha < 0.999 {
                     blend_over(color[idx], out, alpha)
                 } else {
                     rgb(out[0], out[1], out[2])
@@ -261,6 +269,7 @@ pub fn draw_triangle_shaded(
             r += d_r_dx;
             g += d_g_dx;
             b += d_b_dx;
+            alpha_w += d_a_dx;
         }
         step_shaded_row(
             [&mut w0_row, &mut w1_row, &mut w2_row],
@@ -272,8 +281,9 @@ pub fn draw_triangle_shaded(
                 &mut r_row,
                 &mut g_row,
                 &mut b_row,
+                &mut a_row,
             ],
-            [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy],
+            [d_iw_dy, d_u_dy, d_v_dy, d_r_dy, d_g_dy, d_b_dy, d_a_dy],
         );
     }
 }
@@ -284,8 +294,8 @@ pub fn draw_triangle_shaded(
 fn step_shaded_row(
     [w0, w1, w2]: [&mut f32; 3],
     [dw0, dw1, dw2]: [f32; 3],
-    attrs: [&mut f32; 6],
-    deltas: [f32; 6],
+    attrs: [&mut f32; 7],
+    deltas: [f32; 7],
 ) {
     *w0 += dw0;
     *w1 += dw1;
