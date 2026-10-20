@@ -32,9 +32,11 @@
 //! | Layer | Type |
 //! |---|---|
 //! | pixels | [`Framebuffer`], [`Target`] |
-//! | rasterizer | [`draw`] (lines, triangles, z-buffer) |
+//! | rasterizer | [`draw`] (lines, triangles, z-buffer, textures, blending) |
 //! | transforms | [`Vec3`], [`Mat4`], [`Camera`] |
-//! | scene | [`Scene`], [`Object`], [`Material`], [`DirectionalLight`] |
+//! | scene | [`Scene`], [`Object`], [`Material`], [`Texture`], [`DirectionalLight`], [`Light`] |
+//! | shadows | [`ShadowMap`], [`ShadowSettings`] |
+//! | post | [`PostProcess`], [`ToneMapping`] |
 //! | frame composition | [`Renderer`], [`AntiAliasing`] |
 
 #![warn(missing_docs)]
@@ -45,9 +47,13 @@ pub mod draw;
 pub mod framebuffer;
 pub mod math;
 pub mod mesh;
+pub mod obj;
 pub mod pipeline;
+pub mod post;
 pub mod renderer;
 pub mod scene;
+pub mod shadow_map;
+pub mod texture;
 
 #[cfg(feature = "window")]
 pub mod window;
@@ -60,13 +66,17 @@ mod parallel;
 pub use aa::AntiAliasing;
 pub use camera::Camera;
 pub use framebuffer::{Framebuffer, Target};
-pub use light::DirectionalLight;
+pub use light::{DirectionalLight, Light, PointLight, SpotLight};
 pub use material::Material;
 pub use math::{Mat4, Vec3};
 pub use mesh::{Mesh, Vertex};
+pub use obj::ObjError;
 pub use pipeline::RenderContext;
+pub use post::{PostProcess, ToneMapping};
 pub use renderer::{RenderOptions, Renderer};
-pub use scene::{DrawMode, Ground, Object, Scene};
+pub use scene::{DrawMode, Fog, Ground, Object, Scene};
+pub use shadow_map::{ShadowMap, ShadowSettings};
+pub use texture::{Texture, WrapMode};
 
 #[cfg(feature = "window")]
 pub use window::AeroglWindow;

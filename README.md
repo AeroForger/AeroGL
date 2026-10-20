@@ -7,7 +7,7 @@ plain library that renders into memory.
 
 Made by AeroForger.
 
-![AeroGL demo: shaded cube and torus, wireframe sphere, ground grid, and planar shadows](docs/screenshot.png)
+![AeroGL demo: textured floor and cube, glass sphere, torus, point/spot lights, shadow map, fog, and ACES tone mapping](docs/pipeline.png)
 
 ```rust
 use aerogl::{Camera, Material, Mesh, Object, Renderer, Scene};
@@ -29,12 +29,26 @@ let pixels: &[u32] = renderer.render(&scene, &Camera::default());
   `Mat4`/`Vec3`. If you want the guts, `Framebuffer`/`Target` and the draw
   functions are public too.
 - A normal 3D pipeline: indexed meshes, perspective camera, depth buffer,
-  near-plane clipping (Sutherland-Hodgman in clip space), backface culling, and
-  Gouraud Blinn-Phong shading (diffuse, specular, and a bit of rim light).
-- Two anti-aliasing modes, `Msaa { factor }` and `Smaa`, and you can switch
-  between them at runtime. If a supersampled request would create a huge frame,
-  the renderer falls back to SMAA automatically, so a large window cannot
-  silently cost 4x the fill rate.
+  near and far clipping (Sutherland-Hodgman in clip space), backface culling,
+  perspective-correct color/UV interpolation, and Gouraud Blinn-Phong shading.
+- **Textures**: UVs on every built-in mesh, bilinear sampling, repeat/clamp/
+  mirror wrapping, and procedural `Texture::checker` / `Texture::from_fn`.
+- **Multiple lights**: the primary directional sun plus any number of
+  `PointLight` and `SpotLight` entries, with smooth distance falloff and spot
+  cones. Ambient, diffuse, specular, rim, and emissive terms.
+- **Shadow mapping**: an optional directional depth pass with PCF filtering,
+  adjustable resolution, bias, and darkness. The older planar mask shadows are
+  still available for a cheap ground-only look.
+- **Transparency**: `Material::alpha` sends an object through a depth-sorted,
+  back-to-front blended pass with depth writes disabled.
+- **Fog** and a **post-process** stage: exposure, Reinhard/ACES tone mapping,
+  saturation, vignette, and gamma.
+- **OBJ loading**: `Mesh::from_obj(&str)` and `Mesh::load_obj(path)` handle
+  positions, UVs, normals, negative indices, and polygon faces.
+- Two anti-aliasing modes, `Msaa { factor }` and `Smaa`, switchable at runtime.
+  If a supersampled request would create a huge frame, the renderer falls back
+  to SMAA automatically, so a large window cannot silently cost 4x the fill
+  rate.
 - Planar shadows that do not stack. Shadow geometry goes into an offscreen
   binary mask, then gets mixed in once per pixel, so overlapping triangles
   cannot make the same spot darker and darker.
@@ -99,6 +113,13 @@ There is a complete example that writes `aerogl.ppm` and needs no window:
 cargo run --release --example offscreen --no-default-features
 ```
 
+For the full feature set (textures, three lights, shadow map, glass, fog, ACES),
+render a still to PPM:
+
+```
+cargo run --release --example pipeline -- out.ppm
+```
+
 Use this on servers, in CI screenshots, in tests, in Wasm, or behind SDL, winit,
 or your own toolkit.
 
@@ -106,16 +127,24 @@ or your own toolkit.
 
 | Type | What it does |
 |---|---|
-| `Renderer` | Holds the buffers, runs the pipeline, and returns pixels. Settings live in `options.aa`, `options.background`, and `options.max_internal_pixels`. `active_aa()` reports the mode actually used at the current size. |
-| `Scene` | Objects, one `DirectionalLight`, and `Ground` settings (`grid`, `shadows`, `shadow_tint`). |
+| `Renderer` | Holds the buffers, runs the pipeline, and returns pixels. Settings live in `options.aa`, `options.background`, `options.max_internal_pixels`, and `options.post`. `active_aa()` reports the mode actually used at the current size. |
+| `Scene` | Objects, the primary `DirectionalLight`, extra `lights`, `Ground` settings (`grid`, `shadows`, `shadow_tint`), optional `fog`, and optional `shadow_map`. |
 | `Object` | `mesh`, `transform`, `material`, `mode`, `casts_shadow`. Builders: `with_transform`, `with_mode`, `with_shadow`. |
 | `DrawMode` | `Shaded`, `Wireframe`, `ShadedWireframe`. |
-| `Mesh` | `Mesh::new(vertices, indices)`, `Mesh::from_triangles(&[(Vec3, Vec3, Vec3)])`, `cube()`, `sphere(stacks, slices)`, `torus(major, minor, big_r, small_r)`. |
-| `Material` | Base color, specular strength and exponent, plus rim light. |
-| `Camera` | Orbit camera: `yaw`, `pitch`, `distance`, `target`, `fov_y_deg`, `near`, `far`. Methods: `orbit()`, `zoom()`, `view()`, `projection(aspect)`. |
-| `Mat4` / `Vec3` | Math. `translation`, `rotation_x/y/z`, `scale`, `perspective`, `look_at`, `transform_h`. |
-| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target. |
-| `draw` | `draw_line`, `draw_line_z`, `draw_triangle_z`, `draw_triangle_gouraud`, `draw_triangle_shadow`, `rgb`, `lerp`. |
+| `Mesh` | `Mesh::new(vertices, indices)`, `Mesh::from_triangles(...)`, `cube()`, `sphere(stacks, slices)`, `torus(major, minor, big_r, small_r)`, `plane(size, subdivisions)`, `from_obj`, `load_obj`, `bounds`, `center`. |
+| `Vertex` | Position, normal, and `uv`. `Vertex::new(pos, normal)` defaults UV to `[0,0]`; `Vertex::with_uv(...)` sets it. |
+| `Material` | Base color, specular strength/exponent, rim, optional `Arc<Texture>`, `alpha`, and `emissive`. Builders: `with_texture`, `with_shared_texture`, `with_alpha`, `with_emissive`. |
+| `Texture` | Packed `0x00RRGGBB` image with bilinear `sample`, `sample_nearest`, `WrapMode` (repeat/clamp/mirror), `from_fn`, `solid`, `checker`. |
+| `Light` | `Point(PointLight)` or `Spot(SpotLight)`. Add with `Scene::add_light`. |
+| `PointLight` / `SpotLight` | Position, color, intensity, range; spots add direction and inner/outer cone angles. |
+| `ShadowSettings` / `ShadowMap` | Resolution, depth bias, darkness, and PCF radius. `ShadowMap` is reusable across frames. |
+| `Fog` | Color plus `start`/`end` camera distances. Set `Scene::fog`. |
+| `PostProcess` / `ToneMapping` | Exposure, Reinhard/ACES curve, saturation, vignette, gamma. Set `Renderer::options.post`. |
+| `Camera` | Orbit camera: `yaw`, `pitch`, `distance`, `target`, `fov_y_deg`, `near`, `far`. Methods: `orbit()`, `zoom()`, `view()`, `projection(aspect)`, `eye()`. |
+| `Mat4` / `Vec3` | Math. `translation`, `rotation_x/y/z`, `scale`, `perspective`, `orthographic`, `look_at`, `transform_h`. |
+| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target with a `depth_write` switch. |
+| `draw` | `draw_line`, `draw_line_z`, `draw_triangle_z`, `draw_triangle_gouraud`, `draw_triangle_shaded`, `draw_triangle_shadow`, `rgb`, `lerp`. |
+| `ObjError` | Line-numbered OBJ parse/I/O failure with `Display` and `std::error::Error`. |
 
 `Renderer::render` borrows the scene without changing it, so animation is just
 updating `Object::transform` between frames. Meshes and materials are plain
@@ -154,6 +183,111 @@ For a custom camera, build the `view` and `proj` matrices yourself and call
 low-level primitives. `pipeline::render_object` draws one mesh with the
 built-in lighting.
 
+## Textures
+
+Every built-in mesh carries UVs: cube faces map one full texture per side,
+spheres use latitude/longitude, the torus wraps around both radii, and the
+subdivided plane stretches `[0,1]` across its whole surface.
+
+```rust
+use aerogl::{Material, Mesh, Object, Texture, WrapMode};
+
+let checker = Texture::checker(256, 8, [0.85, 0.85, 0.85], [0.08, 0.08, 0.08])
+    .with_wrap(WrapMode::Repeat);
+
+scene.add(Object::new(
+    Mesh::plane(20.0, 20),
+    Material::new([1.0, 1.0, 1.0]).with_texture(checker),
+));
+```
+
+`Texture::from_fn(width, height, |u, v| [r, g, b])` builds anything procedural;
+`Texture::new(width, height, pixels)` takes packed `0x00RRGGBB` data. Sampling is
+bilinear by default with repeat, clamp, or mirror wrapping. Textures are shared
+through `Arc`, so cloning a `Material` does not copy texels; use
+`with_shared_texture` when several materials use the same image.
+
+UVs and vertex colors are interpolated perspective-correctly (`attribute / w`,
+then divided by the interpolated `1 / w`), so a floor texture stays stable when
+it runs away from the camera.
+
+## Lights
+
+`Scene::light` is the primary sun. `Scene::lights` adds point and spot lights on
+top of it:
+
+```rust
+use aerogl::{Light, PointLight, SpotLight, Vec3};
+
+scene.add_light(Light::Point(
+    PointLight::new(Vec3::new(3.0, 2.0, 1.0), [1.0, 0.5, 0.2])
+        .with_intensity(2.5)
+        .with_range(10.0),
+));
+
+scene.add_light(Light::Spot(
+    SpotLight::new(Vec3::new(0.0, 6.0, 0.0), Vec3::new(0.0, -1.0, 0.0), [0.4, 0.7, 1.0])
+        .with_intensity(2.5)
+        .with_range(14.0)
+        .with_cone(16.0, 30.0),
+));
+```
+
+Point and spot lights use a smooth quadratic falloff that reaches zero at
+`range` (`0` disables falloff). Spots fade smoothly between the inner and outer
+cone angles. Lighting is per vertex (Gouraud), so subdivide large surfaces when
+you need a local light to show up across them.
+
+## Transparency
+
+```rust
+let glass = Material::new([0.6, 0.82, 1.0])
+    .with_alpha(0.35)
+    .with_specular(1.0, 128.0);
+```
+
+Materials with `alpha < 1` are held out of the opaque pass. After the opaque
+objects finish, transparent objects are sorted by the distance of their
+world-space bounding-box centers and drawn farthest-first with depth writes
+disabled, so they blend over the scene without hiding each other. Sorting is
+per object, not per triangle; interpenetrating transparent meshes can still pop.
+
+## Fog and post-processing
+
+```rust
+use aerogl::{Fog, PostProcess, ToneMapping};
+
+scene.fog = Some(Fog::new([0.03, 0.05, 0.09], 12.0, 34.0));
+
+renderer.options.post = PostProcess::default()
+    .with_exposure(1.2)
+    .with_tone_mapping(ToneMapping::Aces)
+    .with_saturation(1.08)
+    .with_vignette(0.2)
+    .with_gamma(1.0);
+```
+
+Fog mixes vertex colors toward the fog color between `start` and `end` camera
+distances. The post pass runs after anti-aliasing and before pixels are
+returned: exposure, Reinhard or ACES tone mapping, saturation, vignette, and
+display gamma. The default `PostProcess` is a strict identity transform and is
+skipped entirely.
+
+## OBJ models
+
+```rust
+use aerogl::Mesh;
+
+let mesh = Mesh::load_obj("assets/teapot.obj")?;
+```
+
+`Mesh::from_obj(&str)` parses the same format from memory. Positions, UVs,
+normals, comments, negative (relative) indices, and convex polygon faces are
+supported. Faces are fan-triangulated, missing UVs default to `[0,0]`, and
+missing normals are generated as smooth vertex normals. Material (`mtllib` /
+`usemtl`), group, and smoothing statements are ignored; assign a `Material` in
+the scene instead.
+
 ## Anti-aliasing
 
 ```rust
@@ -188,8 +322,10 @@ renderer.options.max_internal_pixels = None;
 renderer.options.max_internal_pixels = Some(3840 * 2160);
 ```
 
-Render-only frame times on the 1,988-triangle demo scene (release build,
-12 hardware threads; presenting the window adds a little more). Measured with
+Render-only frame times for the 1,988-triangle benchmark scene in
+`tests/perf.rs` (release build, 12 hardware threads; presenting the window adds
+a little more). This scene predates textures, the shadow map, and post, so it
+measures the base rasterizer. Measured with
 `cargo test --release -- --ignored --nocapture` on this machine:
 
 | Resolution | AA | ms/frame | fps |
@@ -207,10 +343,18 @@ Render-only frame times on the 1,988-triangle demo scene (release build,
 At 1920x1080 a 2x MSAA buffer is 8,294,400 pixels, over the default 4M budget,
 so the request falls back to SMAA, and the table reports that resolved cost.
 Set `max_internal_pixels = None` to render the supersampled frame anyway: the
-showcase harness measures it at about 7.4 ms/frame at 1920x1080, a little over
-twice SMAA, and it climbs fast from there.
+benchmark measures it at about 7.4 ms/frame at 1920x1080, a little over twice
+SMAA, and it climbs fast from there.
+
+For scale, the full 0.4 pipeline scene (`examples/pipeline.rs`: 4,836
+triangles, three lights, 1536x1536 shadow map, textures, fog, and ACES)
+renders 1280x720 with SMAA in about 30 ms/frame on the same machine.
 
 ## Shadows
+
+There are two independent shadow paths.
+
+### Planar shadows (cheap, ground only)
 
 Objects project onto the ground plane along the light direction. Each frame
 does this:
@@ -227,9 +371,49 @@ you one tint. That is the fix for the blotchy, double-darkened shadows from the
 old direct-blend version. There is also an integration test that checks two
 coincident casters look pixel-identical to one.
 
-The limits: shadows are hard-edged, they only land on the ground plane and not
-on other objects, and only geometry above the plane casts them. That is the
-trade for keeping this simple. Real shadow mapping is not in here yet.
+They are hard-edged, they only land on the ground plane, and only geometry above
+the plane casts them. Toggle them with `scene.ground.shadows`.
+
+### Directional shadow map
+
+Enable real shadows on any receiving surface with one line:
+
+```rust
+use aerogl::ShadowSettings;
+
+scene.shadow_map = Some(
+    ShadowSettings::new(1024)   // depth-map resolution
+        .with_bias(0.0035)      // fights shadow acne
+        .with_darkness(0.65)    // 0 = black, 1 = no shadow
+        .with_pcf_radius(1),    // 3x3 percentage-closer filter
+);
+```
+
+The frame then builds a depth-only pass from the sun:
+
+1. Fit an orthographic light camera to the world-space bounds of all objects.
+2. Rasterize every shadow caster into a square depth map (near/far clipped).
+3. While shading each vertex, project it into the light, compare depths, and
+   average a `(2r+1)^2` PCF neighborhood. The result multiplies the sun's
+   diffuse and specular terms.
+
+`Renderer` owns a reusable `ShadowMap`, so a loop only clears and refills it.
+The standalone `pipeline::render_scene` helpers allocate one on demand;
+`render_scene_clear_with_shadow_map` accepts your own if you want control.
+
+Things to know:
+
+- Sampling is per vertex, because shading is Gouraud. Receivers need enough
+  vertices to show a shadow edge: `Mesh::plane(size, subdivisions)` is
+  subdivided for exactly this reason.
+- Only the `DirectionalLight` casts a shadow map. Point and spot lights light
+  the scene but do not cast shadows yet.
+- Transparent objects cast if `casts_shadow` is true; they still blend normally
+  when drawn.
+- Turning on both planar shadows and the shadow map double-darkens the ground.
+  Pick one.
+- Shadow maps use a single cascade and a fixed bias. Very large scenes lose
+  resolution; raise `size` or tighten the scene bounds.
 
 ## Demo
 
@@ -237,22 +421,27 @@ trade for keeping this simple. Real shadow mapping is not in here yet.
 cargo run --release
 ```
 
-A spinning shaded cube and torus, plus a wireframe sphere, over a depth-tested
-ground grid with planar shadows. The animation is time based, so the speed does
-not depend on frame rate.
+A textured checker floor, a textured spinning cube, a torus, and a transparent
+glass sphere, lit by the sun plus an orbiting warm point light and a sweeping
+cool spot. Directional shadow mapping, distance fog, and ACES tone mapping with
+a vignette are on by default. The animation is time based, so speed does not
+depend on frame rate.
 
 | Key or input | Action |
 |---|---|
 | **C** | cycle render mode: shaded, wireframe, then shaded + wireframe |
 | **A** | cycle anti-aliasing: off, SMAA, then MSAA 2x (shown as capped when the buffer is too large) |
-| **G** | toggle grid |
-| **S** | toggle shadows |
+| **G** | toggle the ground grid overlay |
+| **S** | toggle directional shadow mapping |
+| **F** | toggle distance fog |
+| **T** | toggle the graded post-process (ACES + vignette) |
 | **Space** | pause or resume animation |
 | drag | orbit camera |
 | scroll | zoom |
 | **Esc** | quit |
 
-The title bar shows the mode, AA mode, triangle count, and smoothed FPS.
+The title bar shows the mode, AA mode, triangle count, shadow/fog state, and
+smoothed FPS.
 
 ## Feature flags and platforms
 
@@ -332,25 +521,42 @@ pass and the merged clear, the same 1440p SMAA frame took about 17.8 ms.
 src/
   lib.rs          crate root, module docs, re-exports
   main.rs         demo binary (window feature)
-  renderer.rs     Renderer, RenderOptions, AA selection
-  framebuffer.rs  Framebuffer + Target (color and depth storage)
-  pipeline.rs     transforms, clipping, shading, grid, shadow mask
-  scene.rs        Scene, Object, DrawMode, Ground
+  renderer.rs     Renderer, RenderOptions, AA selection, post pass
+  framebuffer.rs  Framebuffer + Target (color/depth storage, depth writes)
+  pipeline/
+    mod.rs        public re-exports and module docs
+    shade.rs      sun, point/spot lights, shadow sampling, fog
+    clip.rs       near/far clipping and screen mapping
+    object.rs     vertex prep, clipping, and raster dispatch
+    frame.rs      shared frame prep, banded pass, transparency
+    grid.rs       ground grid projection and drawing
+    shadow.rs     planar shadow mask, projection, compositing
+  scene.rs        Scene, Object, DrawMode, Ground, Fog
   camera.rs       orbit camera -> view/projection matrices
-  mesh.rs         indexed meshes + cube/sphere/torus generators
-  math.rs         Vec3, Mat4
-  material.rs     Blinn-Phong material parameters
-  light.rs        DirectionalLight
+  mesh.rs         indexed meshes, UVs, cube/sphere/torus/plane, OBJ helpers
+  math.rs         Vec3, Mat4 (perspective + orthographic)
+  material.rs     Blinn-Phong material + texture/alpha/emissive
+  light.rs        DirectionalLight, PointLight, SpotLight, Light
+  texture.rs      packed textures, wrapping, bilinear sampling, checker
+  obj.rs          Wavefront OBJ parser and ObjError
+  shadow_map.rs   directional depth pass, PCF sampling, ShadowSettings
+  post.rs         exposure, tone mapping, saturation, vignette, gamma
   aa.rs           MSAA resolve + simplified SMAA
   parallel.rs     worker-count helpers and the AEROGL_THREADS override
   draw/
     pixel.rs      color packing, edge function, lerp, luma
     line.rs       clipped lines with optional depth test
-    triangle.rs   barycentric z-buffered fill, Gouraud, shadow tint
+    triangle/
+      mod.rs      public rasterizer re-exports
+      shaded.rs   perspective-correct shading, textures, alpha blending
+      flat.rs     shared barycentric core, flat fill, shadow tint
+      buffers.rs  mask coverage and depth-only passes
   window.rs       optional minifb frontend
   legacy/         the original learning code, kept for history, not compiled
 examples/
-  offscreen.rs    headless render -> PPM
+  offscreen.rs    minimal headless render -> PPM
+  pipeline.rs     full-feature headless render -> PPM
+  showcase.rs     deterministic frames for the demo video
 tests/
   public_api.rs   API-level integration tests
   perf.rs         ignored frame-time benchmark
@@ -359,28 +565,37 @@ tests/
 ## Testing
 
 ```
-cargo test                                                 # 52 unit + 7 integration + 4 doc tests
+cargo test                                                 # 84 unit + 16 integration + 4 doc tests
 cargo test --release -- --ignored --nocapture              # benchmarks
 cargo clippy --all-targets -- -D warnings
 ```
 
-Coverage includes projection math (near maps to -1, far maps to +1),
-matrix/vector identities, mesh winding vs. normals for all generators,
-near-plane clipping, z-buffer ordering, off-screen line and triangle
-termination, Gouraud interpolation, shadow projection and single-composite
-behavior, AA resolve and SMAA edge cases, banded renders matching a
-single-threaded frame, and public API usage.
+Tests cover projection math (near maps to -1, far maps to +1), matrix/vector
+identities, mesh winding vs. normals for all generators, near/far clipping,
+z-buffer ordering, off-screen line and triangle termination,
+perspective-correct texture sampling, alpha blending, point-light falloff,
+fog, OBJ parsing (including negative indices and generated normals),
+shadow-map projection, tone mapping, AA resolve and SMAA edge cases, banded
+renders matching a single-threaded frame, and public API usage.
 
 ## Known limitations and next steps
 
-- Affine color interpolation across triangles, not perspective correct. Fine
-  for small and medium faces, visible on large ground quads at steep angles.
-- No textures, alpha blending, or sample-level MSAA shading (supersampling
-  stands in).
-- Hard planar shadows only.
-- One directional light. No point or spot lights.
-- No far-plane clipping. The projection handles depth, but geometry beyond
-  `far` is not culled.
+- Lighting is per vertex (Gouraud), including shadow-map sampling. Per-pixel
+  shading would need a G-buffer or an interpolated normal/material path; large
+  flat surfaces need subdivision for local highlights and crisp shadows.
+- Transparency is sorted per object by bounding-box center, not per triangle.
+  Interpenetrating transparent meshes can pop. Depth writes are disabled for
+  the transparent pass.
+- Shadow maps exist only for the primary directional light. There are no
+  point/spot cube maps, cascades, or per-object shadow culling yet.
+- Textures are LDR packed `u32` images with bilinear filtering only. No mipmaps,
+  anisotropic filtering, normal maps, or PBR.
+- The tone-mapping post pass runs on the 8-bit output, not on a floating-point
+  HDR framebuffer, so it cannot recover highlights that were clamped earlier.
+- OBJ only. Material libraries (`mtl`) and group-level materials are ignored;
+  glTF, FBX, and skeletal animation are not supported.
+- No sample-level MSAA shading; `Msaa` is supersampling plus a box resolve.
+- The scene is flat: `Object` has a model matrix but no parent/child hierarchy.
 
 ## License
 

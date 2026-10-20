@@ -183,6 +183,7 @@ pub fn draw_line_z(
     let (dx, dy) = (seg.x1 - seg.x0, seg.y1 - seg.y0);
     let dt = seg.t1 - seg.t0;
     let band_start = target.band_offset();
+    let depth_write = target.depth_write;
     let Some((i0, i1)) = step_range_for_band(
         &seg,
         steps,
@@ -203,7 +204,9 @@ pub fn draw_line_z(
         let idx = (y as usize - band_start) * target.width + x as usize;
         let z = lerp(z0, z1, t);
         if z <= target.depth[idx] {
-            target.depth[idx] = z;
+            if depth_write {
+                target.depth[idx] = z;
+            }
             target.color[idx] = color;
         }
     }

@@ -3,3 +3,6 @@
 
 # The TikTok/showcase video pipeline (Manim, ffmpeg, audio). Kept local.
 /video/
+
+# Local code reviews and notes. Not part of the crate.
+/reports/

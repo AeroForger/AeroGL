@@ -1,23 +1,30 @@
-// AeroGL demo: a spinning cube and torus (Blinn-Phong Gouraud shading) plus a
-// wireframe sphere, over a depth-tested ground grid with planar shadows.
+// AeroGL demo: textured surfaces, multiple lights, real shadow mapping, fog,
+// tone mapping, and sorted alpha blending.
 //
 // Controls:
 //   C     cycle object render mode (shaded / wireframe / both)
 //   A     cycle anti-aliasing (off / SMAA / MSAA 2x, 4 samples)
 //   G     toggle ground grid
-//   S     toggle shadows
+//   S     toggle directional shadow mapping
+//   F     toggle distance fog
+//   T     toggle the graded post-process (ACES + vignette)
 //   Space pause / resume animation
 //   drag  orbit camera, scroll to zoom, Esc to quit
 //
-// The same scene can be rendered headless. See examples/offscreen.rs.
+// The same scene can be rendered headless. See examples/offscreen.rs and
+// examples/pipeline.rs.
 //
 // Made by AeroForger
 
 use aerogl::{
-    AeroglWindow, AntiAliasing, Camera, DrawMode, Mat4, Material, Mesh, Object, Scene, Vec3,
+    AeroglWindow, AntiAliasing, Camera, DrawMode, Fog, Light, Mat4, Material, Mesh, Object,
+    PointLight, PostProcess, Scene, ShadowSettings, SpotLight, Texture, ToneMapping, Vec3,
 };
 use minifb::{Key, MouseButton, MouseMode};
+use std::sync::Arc;
 use std::time::Instant;
+
+const GROUND_Y: f32 = -1.35;
 
 const RENDER_MODES: [DrawMode; 3] = [
     DrawMode::Shaded,
@@ -50,38 +57,107 @@ fn next_aa(aa: AntiAliasing) -> AntiAliasing {
     }
 }
 
-fn main() {
-    let mut app = AeroglWindow::new("AeroGL", 800, 800).expect("could not open a window");
-    let mut scene = Scene::new();
+fn graded_post() -> PostProcess {
+    PostProcess::default()
+        .with_exposure(1.25)
+        .with_tone_mapping(ToneMapping::Aces)
+        .with_saturation(1.08)
+        .with_vignette(0.22)
+}
 
+fn main() {
+    let mut app = AeroglWindow::new("AeroGL", 1000, 720).expect("could not open a window");
+    let mut scene = Scene::new();
+    scene.ground.y = GROUND_Y;
+    scene.ground.grid = false;
+    // The shadow map replaces the old planar shadows in this demo.
+    scene.ground.shadows = false;
+    scene.shadow_map = Some(
+        ShadowSettings::new(1024)
+            .with_bias(0.0035)
+            .with_darkness(0.62),
+    );
+
+    // A checkerboard floor: the mesh is subdivided so per-vertex lighting and
+    // the shadow map can vary across it.
+    let floor_tex = Arc::new(
+        Texture::checker(256, 16, [0.20, 0.24, 0.31], [0.10, 0.12, 0.16])
+            .with_wrap(aerogl::WrapMode::Repeat),
+    );
+    scene.add(
+        Object::new(
+            Mesh::plane(18.0, 24),
+            Material::new([1.0, 1.0, 1.0])
+                .with_shared_texture(floor_tex)
+                .with_specular(0.08, 24.0)
+                .with_rim(0.0),
+        )
+        .with_transform(Mat4::translation(Vec3::new(0.0, GROUND_Y - 0.002, 0.0)))
+        .with_shadow(false),
+    );
+
+    let cube_tex = Arc::new(Texture::checker(
+        128,
+        4,
+        [0.95, 0.48, 0.22],
+        [0.55, 0.20, 0.08],
+    ));
     let cube = scene.add(
         Object::new(
             Mesh::cube(),
-            Material::new([0.95, 0.42, 0.22]).with_specular(0.55, 64.0),
+            Material::new([1.0, 1.0, 1.0])
+                .with_shared_texture(cube_tex)
+                .with_specular(0.45, 64.0),
         )
-        .with_transform(Mat4::translation(Vec3::new(-2.5, -0.35, 0.0))),
+        .with_transform(Mat4::translation(Vec3::new(-2.6, -0.35, 0.0))),
     );
     let torus = scene.add(
         Object::new(
             Mesh::torus(32, 16, 0.9, 0.35),
-            Material::new([0.30, 0.72, 1.0]).with_specular(0.7, 96.0),
+            Material::new([0.30, 0.72, 1.0]).with_specular(0.85, 96.0),
         )
-        .with_transform(Mat4::translation(Vec3::new(2.0, 0.9, 0.0))),
+        .with_transform(Mat4::translation(Vec3::new(2.1, 0.9, 0.0))),
     );
-    let sphere = scene.add(
+    // Transparent glass sphere: drawn back to front after the opaque pass.
+    let glass = scene.add(
         Object::new(
-            Mesh::sphere(18, 28),
-            Material::new([0.78, 0.84, 0.92]).with_specular(0.2, 24.0),
+            Mesh::sphere(20, 30),
+            Material::new([0.55, 0.82, 1.0])
+                .with_alpha(0.38)
+                .with_specular(1.0, 160.0)
+                .with_rim(0.35),
         )
-        .with_transform(Mat4::translation(Vec3::new(0.1, 0.55, 2.4)))
-        .with_mode(DrawMode::Wireframe),
+        .with_transform(Mat4::translation(Vec3::new(0.2, 0.55, 2.6))),
     );
 
-    let mut camera = Camera::new(0.6, 0.35, 8.0);
+    // Two local lights on top of the sun: a warm orbiting point light and a
+    // cool spot from above.
+    let point_index = scene.add_light(Light::Point(
+        PointLight::new(Vec3::new(3.5, 2.0, 0.0), [1.0, 0.52, 0.22])
+            .with_intensity(2.6)
+            .with_range(9.0),
+    ));
+    let spot_index = scene.add_light(Light::Spot(
+        SpotLight::new(
+            Vec3::new(0.0, 5.5, 0.5),
+            Vec3::new(0.0, -1.0, -0.1),
+            [0.40, 0.70, 1.0],
+        )
+        .with_intensity(2.4)
+        .with_range(12.0)
+        .with_cone(16.0, 30.0),
+    ));
+    scene.fog = Some(Fog::new([0.03, 0.05, 0.08], 11.0, 30.0));
+
+    let mut camera = Camera::new(0.6, 0.30, 9.0);
+    camera.target = Vec3::new(0.0, 0.4, 0.0);
+    app.renderer_mut().options.post = graded_post();
+
     let mut last_mouse: Option<(f32, f32)> = None;
     let mut elapsed = 0.0f32;
     let mut paused = false;
     let mut mode = 0usize;
+    let mut graded = true;
 
     let mut last_time = Instant::now();
     let mut fps = 0.0f32;
@@ -95,6 +171,7 @@ fn main() {
 
         // --- input (one mutable borrow of the window for the whole block) ---
         let mut cycle_aa = false;
+        let mut toggle_post = false;
         {
             let window = app.window_mut();
             if let Some((_, y)) = window.get_scroll_wheel() {
@@ -118,7 +195,26 @@ fn main() {
                 scene.ground.grid = !scene.ground.grid;
             }
             if pressed(Key::S) {
-                scene.ground.shadows = !scene.ground.shadows;
+                scene.shadow_map = if scene.shadow_map.is_some() {
+                    None
+                } else {
+                    Some(
+                        ShadowSettings::new(1024)
+                            .with_bias(0.0035)
+                            .with_darkness(0.62),
+                    )
+                };
+            }
+            if pressed(Key::F) {
+                scene.fog = if scene.fog.is_some() {
+                    None
+                } else {
+                    Some(Fog::new([0.03, 0.05, 0.08], 11.0, 30.0))
+                };
+            }
+            if pressed(Key::T) {
+                graded = !graded;
+                toggle_post = true;
             }
             if pressed(Key::Space) {
                 paused = !paused;
@@ -140,6 +236,13 @@ fn main() {
             let next = next_aa(app.renderer().options.aa);
             app.renderer_mut().options.aa = next;
         }
+        if toggle_post {
+            app.renderer_mut().options.post = if graded {
+                graded_post()
+            } else {
+                PostProcess::default()
+            };
+        }
 
         // --- animate (fixed step so motion speed is frame-rate independent) ---
         if !paused {
@@ -148,19 +251,42 @@ fn main() {
         if let Some(o) = scene.object_mut(cube) {
             // Y-only spin: the cube keeps its bottom face on the ground instead
             // of tilting through it.
-            o.transform = Mat4::translation(Vec3::new(-2.5, -0.35, 0.0))
+            o.transform = Mat4::translation(Vec3::new(-2.6, -0.35, 0.0))
                 .multiply(&Mat4::rotation_y(elapsed * 0.7));
         }
         if let Some(o) = scene.object_mut(torus) {
-            o.transform = Mat4::translation(Vec3::new(2.0, 0.9, 0.0))
+            o.transform = Mat4::translation(Vec3::new(2.1, 0.9, 0.0))
                 .multiply(&Mat4::rotation_x(1.0 + elapsed * 0.6))
                 .multiply(&Mat4::rotation_y(elapsed * 0.4))
                 .multiply(&Mat4::scale(Vec3::new(0.85, 0.85, 0.85)));
         }
-        if let Some(o) = scene.object_mut(sphere) {
-            o.transform = Mat4::translation(Vec3::new(0.1, 0.55, 2.4))
-                .multiply(&Mat4::rotation_y(-elapsed * 0.5));
+        if let Some(o) = scene.object_mut(glass) {
+            o.transform =
+                Mat4::translation(Vec3::new(0.2, 0.65 + (elapsed * 1.4).sin() * 0.15, 2.6))
+                    .multiply(&Mat4::rotation_y(-elapsed * 0.5));
         }
+
+        // Orbit the warm point light around the scene.
+        let angle = elapsed * 0.8;
+        scene.lights[point_index] = Light::Point(
+            PointLight::new(
+                Vec3::new(angle.cos() * 3.8, 2.1, angle.sin() * 3.8),
+                [1.0, 0.52, 0.22],
+            )
+            .with_intensity(2.6)
+            .with_range(9.0),
+        );
+        // Sweep the cool spot slowly across the floor.
+        scene.lights[spot_index] = Light::Spot(
+            SpotLight::new(
+                Vec3::new(angle.sin() * 2.0, 5.5, angle.cos() * 1.5),
+                Vec3::new(-angle.sin() * 0.35, -1.0, -0.2),
+                [0.40, 0.70, 1.0],
+            )
+            .with_intensity(2.4)
+            .with_range(12.0)
+            .with_cone(16.0, 30.0),
+        );
 
         // --- present ---
         app.draw(&scene, &camera).expect("present failed");
@@ -177,7 +303,7 @@ fn main() {
                 format!("{} (capped from {})", aa_label(active), aa_label(selected))
             };
             app.set_title(&format!(
-                "AeroGL - {}, {} | {} tris | {:.0} fps | C mode, A AA, G grid, S shadows",
+                "AeroGL - {} | {} | {} tris | shadows {} | fog {} | {:.0} fps | C A G S F T",
                 mode_label(RENDER_MODES[mode]),
                 aa_text,
                 scene
@@ -185,6 +311,12 @@ fn main() {
                     .iter()
                     .map(|o| o.mesh.tri_count())
                     .sum::<usize>(),
+                if scene.shadow_map.is_some() {
+                    "on"
+                } else {
+                    "off"
+                },
+                if scene.fog.is_some() { "on" } else { "off" },
                 fps
             ));
         }

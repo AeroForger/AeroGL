@@ -79,6 +79,16 @@ impl Vec3 {
     pub fn lerp(&self, o: Self, t: f32) -> Self {
         self.add(o.sub(*self).scale(t))
     }
+
+    /// Component-wise minimum.
+    pub fn min(&self, o: Self) -> Self {
+        Self::new(self.x.min(o.x), self.y.min(o.y), self.z.min(o.z))
+    }
+
+    /// Component-wise maximum.
+    pub fn max(&self, o: Self) -> Self {
+        Self::new(self.x.max(o.x), self.y.max(o.y), self.z.max(o.z))
+    }
 }
 
 impl Add for Vec3 {
@@ -196,6 +206,20 @@ impl Mat4 {
         m
     }
 
+    /// Orthographic projection, using the same right-handed conventions as
+    /// [`Mat4::perspective`]: the camera looks down `-Z`, `near` maps to
+    /// `z_ndc = -1` and `far` maps to `+1`, and `w_clip = 1`.
+    pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
+        let mut m = Mat4::identity();
+        m.m[0][0] = 2.0 / (right - left);
+        m.m[1][1] = 2.0 / (top - bottom);
+        m.m[2][2] = -2.0 / (far - near);
+        m.m[0][3] = -(right + left) / (right - left);
+        m.m[1][3] = -(top + bottom) / (top - bottom);
+        m.m[2][3] = -(far + near) / (far - near);
+        m
+    }
+
     /// Look-at view matrix: eye looking at target, `up` defines roll.
     pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
         let fwd = target.sub(eye).normalize();
@@ -297,6 +321,19 @@ mod tests {
         let p = Mat4::perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
         approx(p.transform_point(Vec3::new(0.0, 0.0, -0.1)).z, -1.0, 1e-4);
         approx(p.transform_point(Vec3::new(0.0, 0.0, -100.0)).z, 1.0, 1e-3);
+    }
+
+    #[test]
+    fn orthographic_maps_near_and_far_and_keeps_w_at_one() {
+        let p = Mat4::orthographic(-2.0, 2.0, -1.0, 1.0, 0.1, 10.0);
+        let near = p.transform_h(Vec3::new(0.0, 0.0, -0.1));
+        approx(near[2], -1.0, 1e-5);
+        approx(near[3], 1.0, 1e-5);
+        let far = p.transform_h(Vec3::new(0.0, 0.0, -10.0));
+        approx(far[2], 1.0, 1e-5);
+        let corner = p.transform_h(Vec3::new(2.0, 1.0, -0.1));
+        approx(corner[0], 1.0, 1e-5);
+        approx(corner[1], 1.0, 1e-5);
     }
 
     #[test]

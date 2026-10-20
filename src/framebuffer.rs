@@ -93,6 +93,10 @@ pub struct Target<'a> {
     pub color: &'a mut [u32],
     /// NDC depth values (smaller is closer) for this band.
     pub depth: &'a mut [f32],
+    /// Whether shading passes may update the depth buffer. The sorted
+    /// transparent pass turns this off so later geometry still resolves
+    /// against the opaque depth, but glass does not occlude other glass.
+    pub depth_write: bool,
     /// First screen row owned by this target.
     y_offset: usize,
     /// Number of rows owned by this target.
@@ -131,6 +135,7 @@ impl<'a> Target<'a> {
             height,
             color,
             depth,
+            depth_write: true,
             y_offset,
             rows,
         }
@@ -183,6 +188,7 @@ impl<'a> Target<'a> {
                 height: self.height,
                 color: band_color,
                 depth: band_depth,
+                depth_write: self.depth_write,
                 y_offset: y,
                 rows,
             });
@@ -197,6 +203,11 @@ impl<'a> Target<'a> {
     pub fn clear(&mut self, background: u32) {
         self.color.fill(background);
         self.depth.fill(f32::INFINITY);
+    }
+
+    /// Enables or disables depth writes for subsequent draws.
+    pub fn set_depth_write(&mut self, enabled: bool) {
+        self.depth_write = enabled;
     }
 
     /// Writes one pixel, ignoring out-of-bounds coordinates.

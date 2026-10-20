@@ -4,11 +4,13 @@
 use crate::aa::{AntiAliasing, SmaaScratch, apply_smaa_with_scratch, resolve_downsample};
 use crate::camera::Camera;
 use crate::framebuffer::Framebuffer;
-use crate::pipeline::{ShadowMask, render_scene_clear};
+use crate::pipeline::{ShadowMask, render_scene_clear_with_shadow_map};
+use crate::post::PostProcess;
 use crate::scene::Scene;
+use crate::shadow_map::{ShadowMap, ShadowSettings};
 
 /// Options that affect how a frame is produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderOptions {
     /// Anti-aliasing strategy.
     pub aa: AntiAliasing,
@@ -22,6 +24,8 @@ pub struct RenderOptions {
     /// still frame but can halve the frame rate. The default cap is a 4K
     /// buffer; set this to `None` to let MSAA use whatever the mode asks for.
     pub max_internal_pixels: Option<usize>,
+    /// Exposure, tone mapping, gamma, and vignette applied to the final image.
+    pub post: PostProcess,
 }
 
 impl Default for RenderOptions {
@@ -32,6 +36,7 @@ impl Default for RenderOptions {
             // One 4K frame. MSAA is still available at ordinary window sizes,
             // but a 1440p or 4K window falls back to the cheaper SMAA pass.
             max_internal_pixels: Some(4_000_000),
+            post: PostProcess::default(),
         }
     }
 }
@@ -59,6 +64,7 @@ pub struct Renderer {
     internal: Framebuffer,
     output: Framebuffer,
     shadow: ShadowMask,
+    shadow_map: ShadowMap,
     smaa: SmaaScratch,
 }
 
@@ -73,6 +79,8 @@ impl Renderer {
             internal: Framebuffer::new(width, height),
             output: Framebuffer::new(width, height),
             shadow: ShadowMask::new(),
+            // Grown on first use when a scene enables shadow mapping.
+            shadow_map: ShadowMap::new(ShadowSettings::new(16)),
             smaa: SmaaScratch::new(),
         }
     }
@@ -107,12 +115,13 @@ impl Renderer {
             self.output.resize(self.width, self.height);
             {
                 let mut target = self.output.target();
-                render_scene_clear(
+                render_scene_clear_with_shadow_map(
                     &mut target,
                     scene,
                     camera,
                     &mut self.shadow,
                     self.options.background,
+                    &mut self.shadow_map,
                 );
             }
             if aa == AntiAliasing::Smaa {
@@ -128,12 +137,13 @@ impl Renderer {
             self.internal.resize(iw, ih);
             {
                 let mut target = self.internal.target();
-                render_scene_clear(
+                render_scene_clear_with_shadow_map(
                     &mut target,
                     scene,
                     camera,
                     &mut self.shadow,
                     self.options.background,
+                    &mut self.shadow_map,
                 );
             }
 
@@ -146,12 +156,18 @@ impl Renderer {
                 scale,
             );
         }
+        crate::post::apply(
+            &mut self.output.color,
+            self.width,
+            self.height,
+            &self.options.post,
+        );
         &self.output.color
     }
 
     /// The anti-aliasing mode this renderer actually uses at its current size.
     ///
-    /// This equals [`RenderOptions::aa`] except when a requested supersampled
+    /// This matches [`RenderOptions::aa`] except when a requested supersampled
     /// buffer would exceed [`RenderOptions::max_internal_pixels`]. In that case
     /// the renderer uses SMAA instead, so a large window cannot quietly turn a
     /// 2x request into a four-times-larger frame.

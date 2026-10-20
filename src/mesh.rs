@@ -1,21 +1,32 @@
-//! Vertex/index mesh storage and procedural mesh generators.
+//! Vertex/index mesh storage, UVs, and procedural mesh generators.
 //! Made by AeroForger
 
 use crate::math::Vec3;
 
-/// A single mesh vertex: position plus surface normal, both in model space.
+/// A single mesh vertex: model-space position, normal, and texture coordinate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vertex {
     /// Position in model space.
     pub pos: Vec3,
     /// Surface normal in model space (should be unit length).
     pub normal: Vec3,
+    /// Texture coordinate, usually in `[0,1]`.
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
-    /// Builds a vertex from a position and normal.
+    /// Builds an untextured vertex from a position and normal (`uv = [0,0]`).
     pub fn new(pos: Vec3, normal: Vec3) -> Self {
-        Self { pos, normal }
+        Self {
+            pos,
+            normal,
+            uv: [0.0, 0.0],
+        }
+    }
+
+    /// Builds a vertex with a texture coordinate.
+    pub fn with_uv(pos: Vec3, normal: Vec3, uv: [f32; 2]) -> Self {
+        Self { pos, normal, uv }
     }
 }
 
@@ -54,6 +65,9 @@ impl Mesh {
     }
 
     /// Axis-aligned cube centered at the origin, side length 2.
+    ///
+    /// Each face is a separate quad with UVs covering the full `[0,1]` square,
+    /// so a single texture appears once per side.
     pub fn cube() -> Mesh {
         let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
         let faces: [[Vec3; 4]; 6] = [
@@ -95,12 +109,19 @@ impl Mesh {
                 v(1.0, -1.0, -1.0),
             ],
         ];
-        let mut tris = Vec::with_capacity(12);
-        for f in faces {
-            tris.push((f[0], f[1], f[2]));
-            tris.push((f[0], f[2], f[3]));
+        let face_uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+
+        let mut mesh = Mesh::default();
+        for face in faces {
+            let normal = face[1].sub(face[0]).cross(face[2].sub(face[0])).normalize();
+            let base = mesh.vertices.len() as u32;
+            for (corner, uv) in face.into_iter().zip(face_uvs) {
+                mesh.vertices.push(Vertex::with_uv(corner, normal, uv));
+            }
+            mesh.indices
+                .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        Mesh::from_triangles(&tris)
+        mesh
     }
 
     /// UV sphere centered at the origin, radius 1.
@@ -112,7 +133,8 @@ impl Mesh {
                 let phi = 2.0 * std::f32::consts::PI * j as f32 / slices as f32;
                 let st = theta.sin();
                 let n = Vec3::new(st * phi.cos(), theta.cos(), st * phi.sin());
-                mesh.vertices.push(Vertex::new(n, n));
+                let uv = [j as f32 / slices as f32, i as f32 / stacks as f32];
+                mesh.vertices.push(Vertex::with_uv(n, n, uv));
             }
         }
         let idx = |i: usize, j: usize| (i * (slices + 1) + j) as u32;
@@ -146,8 +168,9 @@ impl Mesh {
                 let (sv, cv) = v.sin_cos();
                 let center = Vec3::new(big_r * cu, 0.0, big_r * su);
                 let n = Vec3::new(cv * cu, sv, cv * su);
+                let uv = [i as f32 / major as f32, j as f32 / minor as f32];
                 mesh.vertices
-                    .push(Vertex::new(center.add(n.scale(small_r)), n));
+                    .push(Vertex::with_uv(center.add(n.scale(small_r)), n, uv));
             }
         }
         let idx = |i: usize, j: usize| (i * (minor + 1) + j) as u32;
@@ -164,9 +187,59 @@ impl Mesh {
         mesh
     }
 
+    /// Flat, upward-facing plane centered at the origin in the XZ plane.
+    ///
+    /// `size` is the total side length and `subdivisions` is the number of
+    /// quads per side. UVs cover `[0,1]`, so a texture is stretched across the
+    /// whole plane. A subdivided plane also gives the vertex lighting enough
+    /// vertices to show local point lights and shadow-map shading across a
+    /// floor.
+    pub fn plane(size: f32, subdivisions: usize) -> Mesh {
+        let n = subdivisions.max(1);
+        let half = size * 0.5;
+        let mut mesh = Mesh::default();
+        let normal = Vec3::new(0.0, 1.0, 0.0);
+        for i in 0..=n {
+            let v = i as f32 / n as f32;
+            for j in 0..=n {
+                let u = j as f32 / n as f32;
+                let pos = Vec3::new(-half + size * u, 0.0, -half + size * v);
+                mesh.vertices.push(Vertex::with_uv(pos, normal, [u, v]));
+            }
+        }
+        let idx = |i: usize, j: usize| (i * (n + 1) + j) as u32;
+        for i in 0..n {
+            for j in 0..n {
+                let a = idx(i, j);
+                let b = idx(i + 1, j);
+                let c = idx(i + 1, j + 1);
+                let d = idx(i, j + 1);
+                // (a, b, c) and (a, c, d) point up (+Y).
+                mesh.indices.extend([a, b, c, a, c, d]);
+            }
+        }
+        mesh
+    }
+
     /// Number of triangles in the index buffer.
     pub fn tri_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Parses a Wavefront OBJ file from a string.
+    ///
+    /// See [`Mesh::load_obj`] for the file-based version.
+    pub fn from_obj(source: &str) -> Result<Mesh, crate::obj::ObjError> {
+        crate::obj::parse(source)
+    }
+
+    /// Loads a Wavefront OBJ file from disk.
+    pub fn load_obj(path: impl AsRef<std::path::Path>) -> Result<Mesh, crate::obj::ObjError> {
+        let path = path.as_ref();
+        let source = std::fs::read_to_string(path).map_err(|e| {
+            crate::obj::ObjError::at(0, format!("cannot read {}: {e}", path.display()))
+        })?;
+        crate::obj::parse(&source)
     }
 
     /// Mesh-space bounding sphere radius (distance of the farthest vertex).
@@ -175,6 +248,21 @@ impl Mesh {
             .iter()
             .map(|v| v.pos.length())
             .fold(0.0f32, f32::max)
+    }
+
+    /// Mesh-space axis-aligned bounds `(min, max)`, or `None` for an empty mesh.
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut it = self.vertices.iter().map(|v| v.pos);
+        let first = it.next()?;
+        Some(it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p))))
+    }
+
+    /// Center of the mesh-space bounding box, or [`Vec3::ZERO`] when empty.
+    pub fn center(&self) -> Vec3 {
+        match self.bounds() {
+            Some((lo, hi)) => lo.add(hi).scale(0.5),
+            None => Vec3::ZERO,
+        }
     }
 }
 
@@ -202,7 +290,7 @@ mod tests {
     #[test]
     fn cube_has_six_faces_and_outward_winding() {
         let cube = Mesh::cube();
-        assert_eq!(cube.vertices.len(), 36, "triangle soup: 12 tris x 3 verts");
+        assert_eq!(cube.vertices.len(), 24, "4 corners per face");
         assert_eq!(cube.tri_count(), 12);
         assert!((cube.bounding_radius() - 3.0f32.sqrt()).abs() < 1e-4);
         assert_winding_matches_normals(&cube, "cube");
@@ -243,5 +331,35 @@ mod tests {
         assert_eq!(t.tri_count(), 24 * 12 * 2);
         assert_winding_matches_normals(&t, "torus");
         assert!((t.bounding_radius() - 1.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn plane_faces_up_and_has_uvs() {
+        let plane = Mesh::plane(10.0, 4);
+        assert_eq!(plane.tri_count(), 4 * 4 * 2);
+        assert_winding_matches_normals(&plane, "plane");
+        for v in &plane.vertices {
+            assert!(v.normal.y > 0.99);
+            assert!((0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1]));
+        }
+        let (lo, hi) = plane.bounds().unwrap();
+        assert!((hi.x - lo.x - 10.0).abs() < 1e-4);
+        assert!((hi.z - lo.z - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn generated_meshes_have_uvs_in_range() {
+        for mesh in [
+            Mesh::cube(),
+            Mesh::sphere(8, 12),
+            Mesh::torus(12, 8, 1.0, 0.3),
+            Mesh::plane(4.0, 2),
+        ] {
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|v| v.uv[0].is_finite() && v.uv[1].is_finite())
+            );
+        }
     }
 }

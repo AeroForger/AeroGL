@@ -1,9 +1,9 @@
 [package]
 name = "aerogl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A small software 3D rasterizer with an embeddable API. No GPU required."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 keywords = ["graphics", "software-renderer", "rasterizer", "3d", "gamedev"]
 categories = ["graphics", "rendering", "game-development"]
 

@@ -1,4 +1,4 @@
-//! Render plates for the AeroGL showcase video.
+//! Render frames for the AeroGL demo video.
 //!
 //! This is a video-capture helper, not part of the library API. It renders
 //! deterministic frames at 1080x1920 (9:16) and writes raw RGB to stdout so
