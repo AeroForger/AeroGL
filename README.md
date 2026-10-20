@@ -133,16 +133,16 @@ or your own toolkit.
 | `DrawMode` | `Shaded`, `Wireframe`, `ShadedWireframe`. |
 | `Mesh` | `Mesh::new(vertices, indices)` (validates), `Mesh::try_new(...)` / `Mesh::validate()` for recoverable errors, `Mesh::from_triangles(...)`, `cube()`, `sphere(stacks, slices)`, `torus(major, minor, big_r, small_r)`, `plane(size, subdivisions)`, `from_obj`, `load_obj`, `bounds`, `center`. |
 | `Vertex` | Position, normal, and `uv`. `Vertex::new(pos, normal)` defaults UV to `[0,0]`; `Vertex::with_uv(...)` sets it. |
-| `Material` | Base color, specular strength/exponent, rim, optional `Arc<Texture>`, `alpha`, and `emissive`. Builders: `with_texture`, `with_shared_texture`, `with_alpha`, `with_emissive`. |
+| `Material` | Base color, specular strength/exponent, rim, optional `Arc<Texture>`, `alpha`, and `emissive`. Builders: `with_texture`, `with_shared_texture`, `with_alpha`, `with_emissive`. Invalid public alpha values are clamped when used. |
 | `Texture` | Packed `0x00RRGGBB` image with bilinear `sample`, `sample_nearest`, `WrapMode` (repeat/clamp/mirror), `from_fn`, `solid`, `checker`, plus `try_*` constructors that report bad sizes. |
 | `Light` | `Point(PointLight)` or `Spot(SpotLight)`. Add with `Scene::add_light`. |
-| `PointLight` / `SpotLight` | Position, color, intensity, range; spots add direction and inner/outer cone angles. |
-| `ShadowSettings` / `ShadowMap` | Resolution, depth bias, darkness, and PCF radius. `ShadowMap` is reusable across frames. |
+| `PointLight` / `SpotLight` | Position, color, intensity, range; spots add direction and inner/outer cone angles. Negative or non-finite values are repaired when used. |
+| `ShadowSettings` / `ShadowMap` | Resolution, depth bias, darkness, and PCF radius. `ShadowMap` is reusable across frames. `ShadowSettings::validate()` reports values outside the accepted ranges; rendering sanitizes them. |
 | `Fog` | Color plus `start`/`end` camera distances. Set `Scene::fog`. |
 | `PostProcess` / `ToneMapping` | Exposure, Reinhard/ACES curve, saturation, vignette, gamma. Set `Renderer::options.post`. |
-| `Camera` | Orbit camera: `yaw`, `pitch`, `distance`, `target`, `fov_y_deg`, `near`, `far`. Methods: `orbit()`, `zoom()`, `view()`, `projection(aspect)`, `eye()`. |
+| `Camera` | Orbit camera: `yaw`, `pitch`, `distance`, `target`, `fov_y_deg`, `near`, `far`. Methods: `orbit()`, `zoom()`, `view()`, `projection(aspect)`, `eye()`, plus `validate()` for setup checks. |
 | `Mat4` / `Vec3` | Math. `translation`, `rotation_x/y/z`, `scale`, `perspective`, `orthographic`, `look_at`, `transform_h`. |
-| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target with a `depth_write` switch. `Framebuffer::try_new` reports zero or overflowing sizes. |
+| `Framebuffer` / `Target` | Raw color and depth storage, plus a borrowed render target with a `depth_write` switch. `Framebuffer::try_new` reports zero or overflowing sizes, and `is_valid()` checks public fields before borrowing. |
 | `draw` | `draw_line`, `draw_line_z`, `draw_triangle_z`, `draw_triangle_gouraud`, `draw_triangle_shaded`, `draw_triangle_shadow`, `rgb`, `lerp`. |
 | `ObjError` | Line-numbered OBJ parse/I/O failure with `Display` and `std::error::Error`. |
 

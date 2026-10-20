@@ -1,7 +1,10 @@
 //! Lighting: the primary directional sun plus point and spot lights.
 //! Made by AeroForger
 
-use crate::math::Vec3;
+use crate::math::{Vec3, finite_or, finite_vec_or, normalized_or};
+
+/// Direction used when a light direction is zero or non-finite.
+pub(crate) const DEFAULT_LIGHT_DIR: Vec3 = Vec3::new(0.0, -1.0, 0.0);
 
 /// A directional (sun-like) light.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,7 +30,7 @@ impl DirectionalLight {
 
     /// Overrides the ambient term (builder style).
     pub fn with_ambient(mut self, ambient: f32) -> Self {
-        self.ambient = ambient;
+        self.ambient = finite_or(ambient, 0.15).clamp(0.0, 1.0);
         self
     }
 }
@@ -64,23 +67,19 @@ impl PointLight {
 
     /// Sets the color multiplier (builder style).
     pub fn with_intensity(mut self, intensity: f32) -> Self {
-        self.intensity = intensity;
+        self.intensity = finite_or(intensity, 0.0).max(0.0);
         self
     }
 
     /// Sets the falloff range; `0` disables attenuation (builder style).
     pub fn with_range(mut self, range: f32) -> Self {
-        self.range = range;
+        self.range = finite_or(range, 0.0).max(0.0);
         self
     }
 
     /// Smooth quadratic falloff, `1` at the light and `0` at `range`.
     pub fn attenuation(&self, distance: f32) -> f32 {
-        if self.range <= 0.0 {
-            return 1.0;
-        }
-        let t = (distance / self.range).clamp(0.0, 1.0);
-        (1.0 - t * t) * (1.0 - t * t)
+        falloff(distance, self.range)
     }
 }
 
@@ -119,41 +118,38 @@ impl SpotLight {
 
     /// Sets the cone angles in degrees (builder style).
     pub fn with_cone(mut self, inner_deg: f32, outer_deg: f32) -> Self {
-        self.inner_angle_deg = inner_deg;
-        self.outer_angle_deg = outer_deg.max(inner_deg + 0.01);
+        let (inner, outer) = cone_angles(inner_deg, outer_deg);
+        self.inner_angle_deg = inner;
+        self.outer_angle_deg = outer;
         self
     }
 
     /// Sets the color multiplier (builder style).
     pub fn with_intensity(mut self, intensity: f32) -> Self {
-        self.intensity = intensity;
+        self.intensity = finite_or(intensity, 0.0).max(0.0);
         self
     }
 
     /// Sets the falloff range (builder style).
     pub fn with_range(mut self, range: f32) -> Self {
-        self.range = range;
+        self.range = finite_or(range, 0.0).max(0.0);
         self
     }
 
     /// Distance falloff, same curve as [`PointLight::attenuation`].
     pub fn attenuation(&self, distance: f32) -> f32 {
-        if self.range <= 0.0 {
-            return 1.0;
-        }
-        let t = (distance / self.range).clamp(0.0, 1.0);
-        (1.0 - t * t) * (1.0 - t * t)
+        falloff(distance, self.range)
     }
 
     /// Cone falloff for a unit vector pointing from the surface toward the
     /// light (`to_light`). Smooth between the inner and outer angle.
     pub fn cone_factor(&self, to_light: Vec3) -> f32 {
-        let axis = self.direction.normalize();
+        let axis = normalized_or(self.direction, DEFAULT_LIGHT_DIR);
         // `to_light` points toward the light, so the ray from the light toward
         // the surface is `-to_light`.
+        let to_light = finite_vec_or(to_light, Vec3::ZERO);
         let cos = (-to_light).dot(axis).clamp(-1.0, 1.0);
-        let inner = self.inner_angle_deg.to_radians().cos();
-        let outer = self.outer_angle_deg.to_radians().cos();
+        let (inner, outer) = cone_cosines(self.inner_angle_deg, self.outer_angle_deg);
         if cos <= outer {
             return 0.0;
         }
@@ -175,6 +171,45 @@ pub enum Light {
     Point(PointLight),
     /// Cone-shaped spot light.
     Spot(SpotLight),
+}
+
+/// Distance falloff shared by point and spot lights.
+pub(crate) fn falloff(distance: f32, range: f32) -> f32 {
+    let range = finite_or(range, 0.0).max(0.0);
+    if range <= 0.0 {
+        return 1.0;
+    }
+    let distance = finite_or(distance, 0.0).max(0.0);
+    let t = (distance / range).clamp(0.0, 1.0);
+    (1.0 - t * t) * (1.0 - t * t)
+}
+
+/// Clamps cone angles so `outer` is always slightly wider than `inner`.
+pub(crate) fn cone_angles(inner_deg: f32, outer_deg: f32) -> (f32, f32) {
+    let inner = finite_or(inner_deg, 15.0).clamp(0.0, 179.0);
+    let outer = finite_or(outer_deg, 30.0).clamp(inner + 0.01, 180.0);
+    (inner, outer)
+}
+
+/// Cosine values for a cone, with the angles sanitized first.
+pub(crate) fn cone_cosines(inner_deg: f32, outer_deg: f32) -> (f32, f32) {
+    let (inner, outer) = cone_angles(inner_deg, outer_deg);
+    (inner.to_radians().cos(), outer.to_radians().cos())
+}
+
+/// Repairs cosine values that were set directly on a public [`SpotLight`] or
+/// [`crate::pipeline::ResolvedLight`].
+pub(crate) fn sanitize_cone_cosines(inner_cos: f32, outer_cos: f32) -> (f32, f32) {
+    let inner = finite_or(inner_cos, 1.0).clamp(-1.0, 1.0);
+    let outer = finite_or(outer_cos, -1.0).clamp(-1.0, 1.0);
+    if inner > outer {
+        (inner, outer)
+    } else {
+        // Inverted or equal values would divide by zero. Keep a narrow band
+        // around the requested inner edge instead of calling acos per vertex.
+        let center = inner.clamp(-1.0, 1.0 - 2e-4);
+        ((center + 1e-4).min(1.0), (center - 1e-4).max(-1.0))
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +236,42 @@ mod tests {
         assert!((spot.cone_factor(Vec3::new(0.0, 1.0, 0.0)) - 1.0).abs() < 1e-6);
         // Far sideways: outside the outer cone.
         assert_eq!(spot.cone_factor(Vec3::new(5.0, 0.0, 0.0)), 0.0);
+    }
+
+    #[test]
+    fn inverted_or_non_finite_cone_angles_are_repaired() {
+        let mut spot = SpotLight::new(Vec3::ZERO, Vec3::new(0.0, -1.0, 0.0), [1.0; 3]);
+        spot.inner_angle_deg = 70.0;
+        spot.outer_angle_deg = 20.0;
+        let inside = spot.cone_factor(Vec3::new(0.0, 1.0, 0.0));
+        assert!((0.0..=1.0).contains(&inside), "cone factor {inside}");
+
+        spot.inner_angle_deg = f32::NAN;
+        spot.outer_angle_deg = f32::INFINITY;
+        let factor = spot.cone_factor(Vec3::new(0.0, 1.0, 0.0));
+        assert!(factor.is_finite() && (0.0..=1.0).contains(&factor));
+    }
+
+    #[test]
+    fn light_builders_sanitize_negative_and_non_finite_values() {
+        let point = PointLight::new(Vec3::ZERO, [1.0; 3])
+            .with_intensity(-2.0)
+            .with_range(f32::NAN);
+        assert_eq!(point.intensity, 0.0);
+        assert_eq!(point.range, 0.0);
+        assert_eq!(point.attenuation(f32::NAN), 1.0);
+
+        let spot = SpotLight::new(Vec3::ZERO, Vec3::ZERO, [1.0; 3])
+            .with_cone(f32::NAN, f32::NAN)
+            .with_intensity(f32::NAN)
+            .with_range(-4.0);
+        assert!(spot.inner_angle_deg.is_finite());
+        assert!(spot.outer_angle_deg > spot.inner_angle_deg);
+        assert_eq!(spot.intensity, 0.0);
+        assert_eq!(spot.range, 0.0);
+
+        let (inner, outer) = sanitize_cone_cosines(f32::NAN, f32::NAN);
+        assert!(inner.is_finite() && outer.is_finite());
+        assert!(inner > outer);
     }
 }

@@ -107,8 +107,24 @@ impl Framebuffer {
     }
 
     /// Borrows the buffers as a [`Target`] for the rasterizer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Framebuffer::is_valid`] is false, for example after the
+    /// public dimensions or buffer lengths were changed independently.
     pub fn target(&mut self) -> Target<'_> {
+        assert!(
+            self.is_valid(),
+            "framebuffer dimensions and buffer lengths disagree"
+        );
         Target::new(self.width, self.height, &mut self.color, &mut self.depth)
+    }
+
+    /// Whether the dimensions and both buffer lengths agree.
+    pub fn is_valid(&self) -> bool {
+        self.width
+            .checked_mul(self.height)
+            .is_some_and(|len| len > 0 && self.color.len() == len && self.depth.len() == len)
     }
 
     /// The pixel slice, for presenting or post-processing.
@@ -185,6 +201,23 @@ impl<'a> Target<'a> {
     #[inline]
     pub fn band_offset(&self) -> usize {
         self.y_offset
+    }
+
+    /// Whether the dimensions, row range, and buffer lengths are consistent.
+    ///
+    /// [`Target`] fields are public, so this is a cheap check before a pass.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.rows > 0
+            && self
+                .y_offset
+                .checked_add(self.rows)
+                .is_some_and(|end| end <= self.height)
+            && self
+                .width
+                .checked_mul(self.rows)
+                .is_some_and(|len| self.color.len() == len && self.depth.len() == len)
     }
 
     /// Number of screen rows owned by this target.
@@ -325,5 +358,33 @@ mod tests {
             Framebuffer::try_new(usize::MAX, 2).err(),
             Some(FramebufferError::SizeOverflow)
         );
+    }
+
+    #[test]
+    fn mismatched_public_fields_are_detected() {
+        let mut fb = Framebuffer::new(4, 4);
+        assert!(fb.is_valid());
+        fb.width = 8;
+        assert!(!fb.is_valid());
+        fb.width = 4;
+        fb.depth.pop();
+        assert!(!fb.is_valid());
+    }
+
+    #[test]
+    fn target_validity_tracks_band_and_buffer_state() {
+        let mut fb = Framebuffer::new(4, 4);
+        {
+            let mut target = fb.target();
+            assert!(target.is_valid());
+            target.width = 0;
+            assert!(!target.is_valid());
+        }
+        let mut fb = Framebuffer::new(4, 4);
+        {
+            let mut target = fb.target();
+            target.rows = 0;
+            assert!(!target.is_valid());
+        }
     }
 }

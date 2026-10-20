@@ -65,10 +65,13 @@ impl Vec3 {
         self.dot(*self).sqrt()
     }
 
-    /// Unit vector, or zero for a zero-length vector.
+    /// Unit vector, or zero for a zero-length or non-finite vector.
     pub fn normalize(&self) -> Self {
+        if !(self.x.is_finite() && self.y.is_finite() && self.z.is_finite()) {
+            return Self::ZERO;
+        }
         let len = self.length();
-        if len > f32::EPSILON {
+        if len.is_finite() && len > f32::EPSILON {
             self.scale(1.0 / len)
         } else {
             Self::ZERO
@@ -123,6 +126,39 @@ impl Div<f32> for Vec3 {
     type Output = Vec3;
     fn div(self, s: f32) -> Vec3 {
         self.scale(1.0 / s)
+    }
+}
+
+/// Returns `value` when it is finite, otherwise `fallback`.
+pub(crate) fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+/// Replaces non-finite vector components with the matching `fallback` values.
+pub(crate) fn finite_vec_or(value: Vec3, fallback: Vec3) -> Vec3 {
+    Vec3::new(
+        finite_or(value.x, fallback.x),
+        finite_or(value.y, fallback.y),
+        finite_or(value.z, fallback.z),
+    )
+}
+
+/// Replaces non-finite color channels with the matching `fallback` values.
+pub(crate) fn finite_rgb_or(value: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    [
+        finite_or(value[0], fallback[0]),
+        finite_or(value[1], fallback[1]),
+        finite_or(value[2], fallback[2]),
+    ]
+}
+
+/// Normalizes `value`, falling back when the input is zero or unusable.
+pub(crate) fn normalized_or(value: Vec3, fallback: Vec3) -> Vec3 {
+    let normalized = finite_vec_or(value, Vec3::ZERO).normalize();
+    if normalized == Vec3::ZERO {
+        finite_vec_or(fallback, Vec3::ZERO).normalize()
+    } else {
+        normalized
     }
 }
 

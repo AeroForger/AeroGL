@@ -3,8 +3,45 @@
 //! Made by AeroForger
 
 use crate::draw::triangle::draw_triangle_depth;
-use crate::math::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3, finite_or};
 use crate::scene::Scene;
+use std::fmt;
+
+/// A problem with the values in [`ShadowSettings`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShadowSettingsError {
+    /// The map is smaller than 16 texels.
+    SizeTooSmall,
+    /// The map is larger than [`ShadowSettings::MAX_SIZE`].
+    SizeTooLarge,
+    /// Bias is not finite or is negative.
+    InvalidBias,
+    /// Darkness is outside `[0,1]` or not finite.
+    InvalidDarkness,
+    /// PCF radius is larger than 4 texels.
+    InvalidPcfRadius,
+}
+
+impl fmt::Display for ShadowSettingsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeTooSmall => write!(f, "shadow map size must be at least 16"),
+            Self::SizeTooLarge => {
+                write!(
+                    f,
+                    "shadow map size must not exceed {}",
+                    ShadowSettings::MAX_SIZE
+                )
+            }
+            Self::InvalidBias => write!(f, "shadow bias must be finite and non-negative"),
+            Self::InvalidDarkness => write!(f, "shadow darkness must be between 0 and 1"),
+            Self::InvalidPcfRadius => write!(f, "shadow PCF radius must not exceed 4"),
+        }
+    }
+}
+
+impl std::error::Error for ShadowSettingsError {}
 
 /// Shadow-map quality and response settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,23 +69,30 @@ impl Default for ShadowSettings {
 }
 
 impl ShadowSettings {
-    /// A shadow map of `size` x `size` texels.
+    /// Largest accepted shadow-map side length, in texels.
+    ///
+    /// The depth buffer grows with the square of this value. The limit keeps a
+    /// typo in a public field from requesting gigabytes of memory.
+    pub const MAX_SIZE: usize = 4096;
+
+    /// A shadow map of `size` x `size` texels, clamped to
+    /// `16..=ShadowSettings::MAX_SIZE`.
     pub fn new(size: usize) -> Self {
         Self {
-            size: size.max(16),
+            size: size.clamp(16, Self::MAX_SIZE),
             ..Self::default()
         }
     }
 
     /// Sets the depth bias (builder style).
     pub fn with_bias(mut self, bias: f32) -> Self {
-        self.bias = bias;
+        self.bias = finite_or(bias, Self::default().bias).max(0.0);
         self
     }
 
     /// Sets the shadow darkness (builder style).
     pub fn with_darkness(mut self, darkness: f32) -> Self {
-        self.darkness = darkness.clamp(0.0, 1.0);
+        self.darkness = finite_or(darkness, Self::default().darkness).clamp(0.0, 1.0);
         self
     }
 
@@ -56,6 +100,39 @@ impl ShadowSettings {
     pub fn with_pcf_radius(mut self, radius: usize) -> Self {
         self.pcf_radius = radius.min(4);
         self
+    }
+
+    /// Checks that every field is in the range the renderer accepts.
+    ///
+    /// Rendering sanitizes bad values, but this reports them at setup time.
+    pub fn validate(&self) -> Result<(), ShadowSettingsError> {
+        if self.size < 16 {
+            return Err(ShadowSettingsError::SizeTooSmall);
+        }
+        if self.size > Self::MAX_SIZE {
+            return Err(ShadowSettingsError::SizeTooLarge);
+        }
+        if !self.bias.is_finite() || self.bias < 0.0 {
+            return Err(ShadowSettingsError::InvalidBias);
+        }
+        if !self.darkness.is_finite() || !(0.0..=1.0).contains(&self.darkness) {
+            return Err(ShadowSettingsError::InvalidDarkness);
+        }
+        if self.pcf_radius > 4 {
+            return Err(ShadowSettingsError::InvalidPcfRadius);
+        }
+        Ok(())
+    }
+
+    /// Repairs public fields before they reach the depth buffer.
+    fn sanitized(self) -> Self {
+        let default = Self::default();
+        Self {
+            size: self.size.clamp(16, Self::MAX_SIZE),
+            bias: finite_or(self.bias, default.bias).max(0.0),
+            darkness: finite_or(self.darkness, default.darkness).clamp(0.0, 1.0),
+            pcf_radius: self.pcf_radius.min(4),
+        }
     }
 }
 
@@ -77,14 +154,15 @@ pub struct ShadowMap {
 impl ShadowMap {
     /// Allocates an empty shadow map.
     pub fn new(settings: ShadowSettings) -> Self {
-        let size = settings.size.max(16);
+        let settings = settings.sanitized();
+        let size = settings.size;
         Self {
             size,
             depth: vec![f32::INFINITY; size * size],
             view_proj: Mat4::identity(),
-            bias: settings.bias.max(0.0),
-            darkness: settings.darkness.clamp(0.0, 1.0),
-            pcf_radius: settings.pcf_radius.min(4),
+            bias: settings.bias,
+            darkness: settings.darkness,
+            pcf_radius: settings.pcf_radius,
         }
     }
 
@@ -120,6 +198,11 @@ impl ShadowMap {
 
         let center = lo.add(hi).scale(0.5);
         let radius = hi.sub(lo).length() * 0.5 + 0.001;
+        if !(center.x.is_finite() && center.y.is_finite() && center.z.is_finite())
+            || !radius.is_finite()
+        {
+            return;
+        }
         let mut dir = scene.light.direction.normalize();
         if dir.length() < 1e-4 {
             dir = Vec3::new(0.0, -1.0, 0.0);
@@ -178,20 +261,24 @@ impl ShadowMap {
     }
 
     fn resize(&mut self, settings: ShadowSettings) {
-        let size = settings.size.max(16);
+        let settings = settings.sanitized();
+        let size = settings.size;
         if size != self.size {
             self.size = size;
             self.depth.resize(size * size, f32::INFINITY);
         }
-        self.bias = settings.bias.max(0.0);
-        self.darkness = settings.darkness.clamp(0.0, 1.0);
-        self.pcf_radius = settings.pcf_radius.min(4);
+        self.bias = settings.bias;
+        self.darkness = settings.darkness;
+        self.pcf_radius = settings.pcf_radius;
     }
 
     /// Returns the lighting factor for a world-space point: `1.0` fully lit,
     /// `0.0` fully shadowed. Points outside the light frustum are lit.
     pub fn visibility(&self, world: Vec3) -> f32 {
         if self.size == 0 {
+            return 1.0;
+        }
+        if !(world.x.is_finite() && world.y.is_finite() && world.z.is_finite()) {
             return 1.0;
         }
         let c = self.view_proj.transform_h(world);
@@ -341,5 +428,52 @@ mod tests {
         let s = ShadowSettings::default().with_pcf_radius(99);
         assert_eq!(s.pcf_radius, 4);
         assert_eq!(ShadowSettings::new(1).size, 16);
+        assert_eq!(
+            ShadowSettings::new(usize::MAX).size,
+            ShadowSettings::MAX_SIZE
+        );
+    }
+
+    #[test]
+    fn invalid_settings_are_sanitized_before_allocation() {
+        let settings = ShadowSettings {
+            size: 8,
+            bias: f32::NAN,
+            darkness: f32::INFINITY,
+            pcf_radius: 99,
+        };
+        assert_eq!(settings.validate(), Err(ShadowSettingsError::SizeTooSmall));
+        let map = ShadowMap::new(settings);
+        assert_eq!(map.size(), 16);
+        assert_eq!(map.darkness, ShadowSettings::default().darkness);
+        assert_eq!(map.bias, ShadowSettings::default().bias);
+        assert_eq!(map.pcf_radius, 4);
+        assert!((map.visibility(Vec3::new(f32::NAN, 0.0, 0.0)) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validate_accepts_defaults_and_reports_bad_ranges() {
+        assert!(ShadowSettings::default().validate().is_ok());
+
+        let too_big = ShadowSettings {
+            size: ShadowSettings::MAX_SIZE + 1,
+            ..ShadowSettings::default()
+        };
+        assert_eq!(too_big.validate(), Err(ShadowSettingsError::SizeTooLarge));
+
+        let bad_bias = ShadowSettings {
+            bias: -1.0,
+            ..ShadowSettings::default()
+        };
+        assert_eq!(bad_bias.validate(), Err(ShadowSettingsError::InvalidBias));
+
+        let bad_darkness = ShadowSettings {
+            darkness: 2.0,
+            ..ShadowSettings::default()
+        };
+        assert_eq!(
+            bad_darkness.validate(),
+            Err(ShadowSettingsError::InvalidDarkness)
+        );
     }
 }

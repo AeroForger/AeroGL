@@ -64,7 +64,7 @@ mod material;
 mod parallel;
 
 pub use aa::AntiAliasing;
-pub use camera::Camera;
+pub use camera::{Camera, CameraError};
 pub use framebuffer::{Framebuffer, FramebufferError, Target};
 pub use light::{DirectionalLight, Light, PointLight, SpotLight};
 pub use material::Material;
@@ -75,7 +75,7 @@ pub use pipeline::{RenderContext, SceneRender};
 pub use post::{PostProcess, ToneMapping};
 pub use renderer::{RenderOptions, Renderer};
 pub use scene::{DrawMode, Fog, Ground, Object, Scene};
-pub use shadow_map::{ShadowMap, ShadowSettings};
+pub use shadow_map::{ShadowMap, ShadowSettings, ShadowSettingsError};
 pub use texture::{Texture, TextureError, WrapMode};
 
 #[cfg(feature = "window")]

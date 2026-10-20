@@ -2,9 +2,10 @@
 // through the public API only, with no window.
 
 use aerogl::{
-    AntiAliasing, Camera, DirectionalLight, DrawMode, Fog, Framebuffer, FramebufferError, Light,
-    Mat4, Material, Mesh, MeshError, Object, PointLight, PostProcess, Renderer, Scene, SceneRender,
-    ShadowSettings, Texture, TextureError, ToneMapping, Vec3, Vertex,
+    AntiAliasing, Camera, CameraError, DirectionalLight, DrawMode, Fog, Framebuffer,
+    FramebufferError, Light, Mat4, Material, Mesh, MeshError, Object, PointLight, PostProcess,
+    Renderer, Scene, SceneRender, ShadowSettings, ShadowSettingsError, Texture, TextureError,
+    ToneMapping, Vec3, Vertex,
 };
 
 fn scene_with_cube() -> Scene {
@@ -471,4 +472,80 @@ fn geometry_beyond_the_far_plane_is_clipped() {
         pixels.iter().all(|&p| p == background),
         "geometry past the far plane must not render"
     );
+}
+
+#[test]
+fn validation_helpers_report_bad_public_values() {
+    assert!(Camera::default().validate().is_ok());
+    let camera = Camera {
+        distance: 0.0,
+        ..Camera::default()
+    };
+    assert_eq!(camera.validate(), Err(CameraError::InvalidDistance));
+
+    assert!(ShadowSettings::default().validate().is_ok());
+    let settings = ShadowSettings {
+        size: 8,
+        bias: f32::NAN,
+        darkness: 2.0,
+        pcf_radius: 99,
+    };
+    assert_eq!(settings.validate(), Err(ShadowSettingsError::SizeTooSmall));
+
+    let mut framebuffer = Framebuffer::new(4, 4);
+    assert!(framebuffer.is_valid());
+    framebuffer.width = 8;
+    assert!(!framebuffer.is_valid());
+}
+
+#[test]
+fn invalid_public_render_inputs_stay_finite() {
+    let mut scene = Scene::new();
+    scene.light.direction = Vec3::ZERO;
+    scene.light.color = [f32::NAN, -1.0, f32::INFINITY];
+    scene.light.ambient = f32::NAN;
+    scene.ground.y = f32::NAN;
+    scene.ground.shadow_tint = [f32::NAN; 3];
+    scene.fog = Some(Fog {
+        color: [f32::NAN; 3],
+        start: f32::NAN,
+        end: f32::INFINITY,
+    });
+    scene.shadow_map = Some(ShadowSettings {
+        size: 0,
+        bias: f32::NAN,
+        darkness: f32::INFINITY,
+        pcf_radius: 99,
+    });
+    scene.add(Object::new(
+        Mesh::cube(),
+        Material {
+            color: [f32::NAN, 1.0, -1.0],
+            specular: f32::NAN,
+            shininess: f32::INFINITY,
+            rim: f32::NAN,
+            texture: None,
+            alpha: f32::NAN,
+            emissive: [f32::NAN, 0.0, 0.0],
+        },
+    ));
+    scene.add_light(Light::Point(PointLight {
+        position: Vec3::new(f32::NAN, 0.0, 0.0),
+        color: [f32::NAN; 3],
+        intensity: -2.0,
+        range: f32::NAN,
+    }));
+
+    let camera = Camera {
+        yaw: f32::NAN,
+        pitch: f32::INFINITY,
+        distance: f32::NAN,
+        target: Vec3::new(f32::NAN, f32::INFINITY, f32::NEG_INFINITY),
+        fov_y_deg: 0.0,
+        near: f32::NAN,
+        far: f32::NAN,
+    };
+    let mut renderer = Renderer::new(64, 48);
+    let pixels = renderer.render(&scene, &camera);
+    assert_eq!(pixels.len(), 64 * 48);
 }

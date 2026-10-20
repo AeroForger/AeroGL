@@ -2,7 +2,7 @@
 
 use crate::draw::triangle::draw_triangle_cover;
 use crate::framebuffer::Target;
-use crate::math::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3, finite_or};
 use crate::scene::{Object, Scene};
 
 use super::clip::{Poly, lerp_clip, ndc_to_screen};
@@ -283,6 +283,7 @@ impl ShadowBand<'_> {
 fn tint_tables(tint: [f32; 3]) -> [[u8; 256]; 3] {
     let mut tables = [[0u8; 256]; 3];
     for (table, scale) in tables.iter_mut().zip(tint) {
+        let scale = finite_or(scale, 0.0).max(0.0);
         for (value, out) in table.iter_mut().enumerate() {
             *out = (value as f32 * scale).clamp(0.0, 255.0) as u8;
         }

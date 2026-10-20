@@ -2,6 +2,7 @@
 //! Made by AeroForger
 
 use crate::draw::{rgb, unpack};
+use crate::math::finite_or;
 
 /// Tone-mapping curve applied to the final image.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,16 +50,20 @@ impl Default for PostProcess {
 impl PostProcess {
     /// Whether this transform would leave every pixel unchanged.
     pub fn is_identity(&self) -> bool {
-        (self.exposure - 1.0).abs() < 1e-6
+        let exposure = finite_or(self.exposure, 1.0).max(0.0);
+        let gamma_value = finite_or(self.gamma, 1.0).max(0.01);
+        let saturation_value = finite_or(self.saturation, 1.0).max(0.0);
+        let vignette_value = finite_or(self.vignette, 0.0).clamp(0.0, 1.0);
+        (exposure - 1.0).abs() < 1e-6
             && self.tone_mapping == ToneMapping::None
-            && (self.gamma - 1.0).abs() < 1e-6
-            && (self.saturation - 1.0).abs() < 1e-6
-            && self.vignette <= 1e-6
+            && (gamma_value - 1.0).abs() < 1e-6
+            && (saturation_value - 1.0).abs() < 1e-6
+            && vignette_value <= 1e-6
     }
 
     /// Sets the exposure (builder style).
     pub fn with_exposure(mut self, exposure: f32) -> Self {
-        self.exposure = exposure.max(0.0);
+        self.exposure = finite_or(exposure, 1.0).max(0.0);
         self
     }
 
@@ -70,26 +75,26 @@ impl PostProcess {
 
     /// Sets the display gamma (builder style).
     pub fn with_gamma(mut self, gamma: f32) -> Self {
-        self.gamma = gamma.max(0.01);
+        self.gamma = finite_or(gamma, 1.0).max(0.01);
         self
     }
 
     /// Sets the saturation (builder style).
     pub fn with_saturation(mut self, saturation: f32) -> Self {
-        self.saturation = saturation.max(0.0);
+        self.saturation = finite_or(saturation, 1.0).max(0.0);
         self
     }
 
     /// Sets the vignette amount (builder style).
     pub fn with_vignette(mut self, vignette: f32) -> Self {
-        self.vignette = vignette.clamp(0.0, 1.0);
+        self.vignette = finite_or(vignette, 0.0).clamp(0.0, 1.0);
         self
     }
 }
 
 /// Tone-maps one linear RGB channel.
 pub fn tone_map_channel(value: f32, tone_mapping: ToneMapping) -> f32 {
-    let x = value.max(0.0);
+    let x = finite_or(value, 0.0).max(0.0);
     match tone_mapping {
         ToneMapping::None => x,
         ToneMapping::Reinhard => x / (1.0 + x),
@@ -173,10 +178,6 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
     }
 }
 
-fn finite_or(value: f32, fallback: f32) -> f32 {
-    if value.is_finite() { value } else { fallback }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +252,35 @@ mod tests {
         apply(&mut pixels, 1, 1, &settings);
         let [r, g, b] = unpack(pixels[0]);
         assert!(r.is_finite() && g.is_finite() && b.is_finite());
+    }
+
+    #[test]
+    fn identity_check_uses_sanitized_values() {
+        let settings = PostProcess {
+            exposure: f32::NAN,
+            gamma: f32::NAN,
+            saturation: f32::NAN,
+            vignette: f32::NAN,
+            ..PostProcess::default()
+        };
+        assert!(settings.is_identity());
+
+        let mut pixels = vec![0x123456];
+        apply(&mut pixels, 1, 1, &settings);
+        assert_eq!(pixels, vec![0x123456]);
+    }
+
+    #[test]
+    fn builders_reject_non_finite_values() {
+        let post = PostProcess::default()
+            .with_exposure(f32::NAN)
+            .with_gamma(f32::NAN)
+            .with_saturation(f32::NAN)
+            .with_vignette(f32::NAN);
+        assert_eq!(post.exposure, 1.0);
+        assert_eq!(post.gamma, 1.0);
+        assert_eq!(post.saturation, 1.0);
+        assert_eq!(post.vignette, 0.0);
+        assert!(post.is_identity());
     }
 }

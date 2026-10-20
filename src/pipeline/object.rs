@@ -2,7 +2,7 @@
 
 use crate::draw::{draw_line_z, draw_triangle_shaded, rgb};
 use crate::framebuffer::Target;
-use crate::math::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3, finite_rgb_or};
 use crate::scene::{DrawMode, Object};
 
 use super::clip::{ClipVertex, clip_far, clip_near, ndc_to_screen};
@@ -45,11 +45,7 @@ pub(super) fn prepare_object(
     } else {
         object.material.color
     };
-    let alpha = if object.material.alpha.is_finite() {
-        object.material.alpha.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
+    let alpha = object.material.effective_alpha();
     let mut out = Vec::with_capacity(object.mesh.vertices.len());
     for v in &object.mesh.vertices {
         let color = if shaded {
@@ -76,7 +72,7 @@ pub(super) fn render_prepared_object(
     prepared: &[ClipVertex],
     near: f32,
 ) {
-    let base = object.material.color;
+    let base = finite_rgb_or(object.material.color, [0.0; 3]);
     let wire_col = rgb(
         base[0] * 0.3 + 0.5,
         base[1] * 0.3 + 0.5,

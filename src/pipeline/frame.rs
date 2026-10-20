@@ -2,7 +2,7 @@
 
 use crate::camera::Camera;
 use crate::framebuffer::Target;
-use crate::math::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3, finite_or};
 use crate::scene::Scene;
 use crate::shadow_map::ShadowMap;
 
@@ -69,6 +69,7 @@ fn prepare_frame(
     height: usize,
     ctx: &RenderContext<'_>,
 ) -> PreparedFrame {
+    let ground_y = scene.ground.sanitized_y();
     let objects = scene
         .objects
         .iter()
@@ -81,14 +82,14 @@ fn prepare_frame(
             near,
             width,
             height,
-            scene.ground.y,
+            ground_y,
             ctx.light_dir,
         )
     } else {
         (Vec::new(), None)
     };
     let grid = if scene.ground.grid {
-        prepare_grid(view_proj, near, width, height, scene.ground.y, 10)
+        prepare_grid(view_proj, near, width, height, ground_y, 10)
     } else {
         Vec::new()
     };
@@ -200,6 +201,9 @@ pub fn render_scene_with(
     camera: &Camera,
     settings: SceneRender<'_>,
 ) {
+    if !target.is_valid() {
+        return;
+    }
     let SceneRender {
         background,
         shadow_mask,
@@ -218,7 +222,7 @@ pub fn render_scene_with(
     let view = camera.view();
     let proj = camera.projection(target.width as f32 / target.height as f32);
     let view_proj = proj.multiply(&view);
-    let near = camera.near;
+    let near = finite_or(camera.near, 0.1).max(1e-4);
 
     // Render the light's depth pass before any shading samples it.
     let mut owned_shadow: ShadowMap;

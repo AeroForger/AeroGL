@@ -1,6 +1,7 @@
 //! Surface material description: albedo, specular, textures, alpha, emission.
 //! Made by AeroForger
 
+use crate::math::finite_or;
 use crate::texture::Texture;
 use std::sync::Arc;
 
@@ -69,7 +70,7 @@ impl Material {
 
     /// Sets the opacity (builder style).
     pub fn with_alpha(mut self, alpha: f32) -> Self {
-        self.alpha = alpha.clamp(0.0, 1.0);
+        self.alpha = finite_or(alpha, 1.0).clamp(0.0, 1.0);
         self
     }
 
@@ -79,9 +80,14 @@ impl Material {
         self
     }
 
+    /// The alpha the renderer uses, sanitized into `[0,1]`.
+    pub(crate) fn effective_alpha(&self) -> f32 {
+        finite_or(self.alpha, 1.0).clamp(0.0, 1.0)
+    }
+
     /// Whether this material needs the blended transparent pass.
     pub fn is_transparent(&self) -> bool {
-        self.alpha < 0.999
+        self.effective_alpha() < 0.999
     }
 }
 
@@ -113,5 +119,23 @@ mod tests {
     fn alpha_clamps_to_unit_range() {
         assert_eq!(Material::new([1.0; 3]).with_alpha(3.0).alpha, 1.0);
         assert_eq!(Material::new([1.0; 3]).with_alpha(-1.0).alpha, 0.0);
+    }
+
+    #[test]
+    fn direct_alpha_values_are_sanitized() {
+        let mut material = Material::new([1.0; 3]);
+        material.alpha = f32::NAN;
+        assert_eq!(material.effective_alpha(), 1.0);
+        assert!(!material.is_transparent());
+
+        material.alpha = -2.0;
+        assert_eq!(material.effective_alpha(), 0.0);
+        assert!(material.is_transparent());
+
+        material.alpha = 4.0;
+        assert_eq!(material.effective_alpha(), 1.0);
+        assert!(!material.is_transparent());
+
+        assert_eq!(Material::new([1.0; 3]).with_alpha(f32::NAN).alpha, 1.0);
     }
 }

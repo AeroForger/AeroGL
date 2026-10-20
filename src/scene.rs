@@ -3,7 +3,7 @@
 
 use crate::light::{DirectionalLight, Light};
 use crate::material::Material;
-use crate::math::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3, finite_or};
 use crate::mesh::Mesh;
 use crate::shadow_map::ShadowSettings;
 
@@ -100,6 +100,14 @@ impl Default for Ground {
     }
 }
 
+impl Ground {
+    /// The ground height the renderer uses, falling back to the default when
+    /// `y` is not finite.
+    pub(crate) fn sanitized_y(&self) -> f32 {
+        finite_or(self.y, Self::default().y)
+    }
+}
+
 /// Distance fog, mixed toward `color` between `start` and `end`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fog {
@@ -119,10 +127,13 @@ impl Fog {
 
     /// The mix factor for a point `distance` away from the camera.
     pub fn factor(&self, distance: f32) -> f32 {
-        if self.end <= self.start {
-            return if distance >= self.end { 1.0 } else { 0.0 };
+        let start = finite_or(self.start, 0.0);
+        let end = finite_or(self.end, start + 1.0);
+        let distance = finite_or(distance, 0.0);
+        if end <= start {
+            return if distance >= end { 1.0 } else { 0.0 };
         }
-        ((distance - self.start) / (self.end - self.start)).clamp(0.0, 1.0)
+        ((distance - start) / (end - start)).clamp(0.0, 1.0)
     }
 }
 
@@ -254,6 +265,19 @@ mod tests {
         assert_eq!(fog.factor(0.0), 0.0);
         assert!((fog.factor(7.5) - 0.5).abs() < 1e-6);
         assert_eq!(fog.factor(99.0), 1.0);
+    }
+
+    #[test]
+    fn non_finite_fog_values_stay_in_range() {
+        let fog = Fog {
+            color: [f32::NAN; 3],
+            start: f32::NAN,
+            end: f32::INFINITY,
+        };
+        for distance in [0.0, 1.0, f32::NAN, f32::INFINITY] {
+            let factor = fog.factor(distance);
+            assert!(factor.is_finite() && (0.0..=1.0).contains(&factor));
+        }
     }
 
     #[test]
