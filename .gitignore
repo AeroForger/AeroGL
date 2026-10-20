@@ -6,3 +6,7 @@
 
 # Local code reviews and notes. Not part of the crate.
 /reports/
+*.md
+
+
+!README.md
