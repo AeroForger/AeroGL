@@ -1,7 +1,7 @@
 //! Post-processing: exposure, tone mapping, saturation, vignette, and gamma.
 //! Made by AeroForger
 
-use crate::draw::{rgb, unpack};
+use crate::draw::rgb;
 use crate::math::finite_or;
 
 /// Tone-mapping curve applied to the final image.
@@ -121,59 +121,122 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
         return;
     }
 
-    let exposure = finite_or(settings.exposure, 1.0).max(0.0);
-    let gamma_value = finite_or(settings.gamma, 1.0).max(0.01);
-    let saturation_value = finite_or(settings.saturation, 1.0).max(0.0);
-    let vignette_value = finite_or(settings.vignette, 0.0).clamp(0.0, 1.0);
-    let inv_gamma = 1.0 / gamma_value;
-    let gamma = (gamma_value - 1.0).abs() > 1e-6;
-    let vignette = vignette_value > 1e-6;
-    let saturation = (saturation_value - 1.0).abs() > 1e-6;
-    let exposure_changed = (exposure - 1.0).abs() > 1e-6;
-    let cx = width as f32 * 0.5;
-    let cy = height as f32 * 0.5;
-    let max_dist = (cx * cx + cy * cy).sqrt().max(1.0);
+    let params = Params::new(width, height, settings);
+    let pixels = &mut pixels[..len];
+    let threads = crate::parallel::threads_for(len, 400_000);
+    if threads <= 1 {
+        apply_rows(pixels, width, 0, height, &params);
+        return;
+    }
 
-    for y in 0..height {
-        let dy = y as f32 + 0.5 - cy;
-        for x in 0..width {
-            let idx = y * width + x;
-            let mut c = unpack(pixels[idx]);
-            let mut transformed = exposure_changed;
-            for channel in &mut c {
-                *channel *= exposure;
-            }
+    // Rows are independent, so each worker owns a contiguous band and no
+    // synchronization is needed inside the loop.
+    let rows_per = height.div_ceil(threads);
+    let mut rest: &mut [u32] = pixels;
+    let mut y = 0;
+    let params = &params;
+    std::thread::scope(|scope| {
+        while y < height {
+            let rows = rows_per.min(height - y);
+            let (band, tail) = rest.split_at_mut(rows * width);
+            scope.spawn(move || apply_rows(band, width, y, rows, params));
+            rest = tail;
+            y += rows;
+        }
+    });
+}
+
+/// Constants and the per-channel table shared by all row bands.
+struct Params {
+    channel: [f32; 256],
+    saturation: f32,
+    saturation_inv: f32,
+    saturation_on: bool,
+    vignette_scale: f32,
+    vignette_on: bool,
+    gamma: bool,
+    inv_gamma: f32,
+    cx: f32,
+    cy: f32,
+}
+
+impl Params {
+    fn new(width: usize, height: usize, settings: &PostProcess) -> Self {
+        let exposure = finite_or(settings.exposure, 1.0).max(0.0);
+        let gamma_value = finite_or(settings.gamma, 1.0).max(0.01);
+        let saturation_value = finite_or(settings.saturation, 1.0).max(0.0);
+        let vignette_value = finite_or(settings.vignette, 0.0).clamp(0.0, 1.0);
+        let gamma = (gamma_value - 1.0).abs() > 1e-6;
+        let vignette_on = vignette_value > 1e-6;
+        let saturation_on = (saturation_value - 1.0).abs() > 1e-6;
+
+        // The input channels are already 8-bit, so exposure and tone mapping
+        // can be done once per byte instead of once per pixel channel.
+        let mut channel = [0.0; 256];
+        for (value, out) in channel.iter_mut().enumerate() {
+            let mut channel = value as f32 / 255.0;
+            channel *= exposure;
             if settings.tone_mapping != ToneMapping::None {
-                for channel in &mut c {
-                    *channel = tone_map_channel(*channel, settings.tone_mapping);
-                }
-                transformed = true;
+                channel = tone_map_channel(channel, settings.tone_mapping);
             }
-            if saturation {
+            *out = channel;
+        }
+
+        let cx = width as f32 * 0.5;
+        let cy = height as f32 * 0.5;
+        let max_dist = (cx * cx + cy * cy).sqrt().max(1.0);
+        Self {
+            channel,
+            saturation: saturation_value,
+            saturation_inv: 1.0 - saturation_value,
+            saturation_on,
+            vignette_scale: vignette_value / max_dist,
+            vignette_on,
+            gamma,
+            inv_gamma: 1.0 / gamma_value,
+            cx,
+            cy,
+        }
+    }
+}
+
+/// Applies the transform to `rows` starting at `y_start`.
+fn apply_rows(pixels: &mut [u32], width: usize, y_start: usize, rows: usize, params: &Params) {
+    for row in 0..rows {
+        let y = y_start + row;
+        let dy = y as f32 + 0.5 - params.cy;
+        let row_start = row * width;
+        for x in 0..width {
+            let idx = row_start + x;
+            let packed = pixels[idx];
+            let mut c = [
+                params.channel[((packed >> 16) & 0xFF) as usize],
+                params.channel[((packed >> 8) & 0xFF) as usize],
+                params.channel[(packed & 0xFF) as usize],
+            ];
+            let factor = if params.vignette_on {
+                let dx = x as f32 + 0.5 - params.cx;
+                1.0 - (dx * dx + dy * dy).sqrt() * params.vignette_scale
+            } else {
+                1.0
+            };
+            if params.saturation_on {
                 let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-                for channel in &mut c {
-                    *channel = luma + (*channel - luma) * saturation_value;
-                }
-                transformed = true;
+                let gray = luma * params.saturation_inv;
+                c[0] = c[0].mul_add(params.saturation, gray) * factor;
+                c[1] = c[1].mul_add(params.saturation, gray) * factor;
+                c[2] = c[2].mul_add(params.saturation, gray) * factor;
+            } else if params.vignette_on {
+                c[0] *= factor;
+                c[1] *= factor;
+                c[2] *= factor;
             }
-            if vignette {
-                let dx = x as f32 + 0.5 - cx;
-                let dist = (dx * dx + dy * dy).sqrt() / max_dist;
-                let factor = 1.0 - vignette_value * dist;
-                for channel in &mut c {
-                    *channel *= factor;
-                }
-                transformed = true;
+            if params.gamma {
+                c[0] = c[0].clamp(0.0, 1.0).powf(params.inv_gamma);
+                c[1] = c[1].clamp(0.0, 1.0).powf(params.inv_gamma);
+                c[2] = c[2].clamp(0.0, 1.0).powf(params.inv_gamma);
             }
-            if gamma || transformed {
-                for channel in &mut c {
-                    *channel = channel.clamp(0.0, 1.0);
-                    if gamma {
-                        *channel = channel.powf(inv_gamma);
-                    }
-                }
-                pixels[idx] = rgb(c[0], c[1], c[2]);
-            }
+            pixels[idx] = rgb(c[0], c[1], c[2]);
         }
     }
 }
@@ -181,6 +244,7 @@ pub fn apply(pixels: &mut [u32], width: usize, height: usize, settings: &PostPro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draw::unpack;
 
     #[test]
     fn identity_does_not_touch_pixels() {
@@ -282,5 +346,34 @@ mod tests {
         assert_eq!(post.saturation, 1.0);
         assert_eq!(post.vignette, 0.0);
         assert!(post.is_identity());
+    }
+
+    #[test]
+    fn banded_apply_matches_a_single_band() {
+        let (width, height) = (800, 600);
+        let source: Vec<u32> = (0..width * height)
+            .map(|i| {
+                let x = (i % width) as u32;
+                let y = (i / width) as u32;
+                ((x * 255 / width as u32) << 16)
+                    | ((y * 255 / height as u32) << 8)
+                    | ((x + y) & 0xFF)
+            })
+            .collect();
+        let settings = PostProcess::default()
+            .with_exposure(1.25)
+            .with_tone_mapping(ToneMapping::Aces)
+            .with_saturation(1.08)
+            .with_vignette(0.22)
+            .with_gamma(2.2);
+
+        let mut expected = source.clone();
+        let params = Params::new(width, height, &settings);
+        apply_rows(&mut expected, width, 0, height, &params);
+
+        let mut actual = source;
+        apply(&mut actual, width, height, &settings);
+
+        assert_eq!(actual, expected);
     }
 }

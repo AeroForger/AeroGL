@@ -8,6 +8,16 @@ use crate::pipeline::{ShadowMask, render_scene_clear_with_shadow_map};
 use crate::post::PostProcess;
 use crate::scene::Scene;
 use crate::shadow_map::{ShadowMap, ShadowSettings};
+use std::time::Instant;
+
+/// Time spent in the last frame's render stages, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderTimings {
+    /// Scene drawing and anti-aliasing.
+    pub scene_ms: f32,
+    /// Post-processing.
+    pub post_ms: f32,
+}
 
 /// Options that affect how a frame is produced.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,6 +76,7 @@ pub struct Renderer {
     shadow: ShadowMask,
     shadow_map: ShadowMap,
     smaa: SmaaScratch,
+    last_timings: RenderTimings,
 }
 
 impl Renderer {
@@ -82,6 +93,7 @@ impl Renderer {
             // Grown on first use when a scene enables shadow mapping.
             shadow_map: ShadowMap::new(ShadowSettings::new(16)),
             smaa: SmaaScratch::new(),
+            last_timings: RenderTimings::default(),
         }
     }
 
@@ -107,6 +119,7 @@ impl Renderer {
     ///
     /// The slice is valid until the next [`Renderer::render`] call.
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> &[u32] {
+        let scene_start = Instant::now();
         let aa = self.active_aa();
         let scale = aa.scale() as usize;
         if scale == 1 {
@@ -156,12 +169,18 @@ impl Renderer {
                 scale,
             );
         }
+        let scene_ms = scene_start.elapsed().as_secs_f32() * 1000.0;
+        let post_start = Instant::now();
         crate::post::apply(
             &mut self.output.color,
             self.width,
             self.height,
             &self.options.post,
         );
+        self.last_timings = RenderTimings {
+            scene_ms,
+            post_ms: post_start.elapsed().as_secs_f32() * 1000.0,
+        };
         &self.output.color
     }
 
@@ -187,6 +206,11 @@ impl Renderer {
     /// The last rendered pixels.
     pub fn pixels(&self) -> &[u32] {
         &self.output.color
+    }
+
+    /// Timings from the last [`Renderer::render`] call.
+    pub fn last_timings(&self) -> RenderTimings {
+        self.last_timings
     }
 }
 

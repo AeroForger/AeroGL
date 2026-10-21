@@ -161,7 +161,11 @@ fn main() {
 
     let mut last_time = Instant::now();
     let mut fps = 0.0f32;
+    let mut scene_ms = 0.0f32;
+    let mut post_ms = 0.0f32;
+    let mut present_ms = 0.0f32;
     let mut title_timer = 0.0f32;
+    let show_timings = std::env::var_os("AEROGL_TIMINGS").is_some();
 
     while app.is_open() {
         let now = Instant::now();
@@ -291,6 +295,11 @@ fn main() {
         // --- present ---
         app.draw(&scene, &camera).expect("present failed");
 
+        let timings = app.last_timings();
+        scene_ms += (timings.scene_ms - scene_ms) * 0.1;
+        post_ms += (timings.post_ms - post_ms) * 0.1;
+        present_ms += (timings.present_ms - present_ms) * 0.1;
+
         // Rebuilding the window title is a platform round-trip: throttle it.
         title_timer += dt;
         if title_timer >= 0.25 {
@@ -302,8 +311,10 @@ fn main() {
             } else {
                 format!("{} (capped from {})", aa_label(active), aa_label(selected))
             };
-            app.set_title(&format!(
-                "AeroGL - {} | {} | {} tris | shadows {} | fog {} | {:.0} fps | C A G S F T",
+            let status = format!(
+                "AeroGL - {}x{} | {} | {} | {} tris | shadows {} | fog {} | {:.0} fps | scene {:.1} post {:.1} present {:.1} ms | C A G S F T",
+                app.renderer().width(),
+                app.renderer().height(),
                 mode_label(RENDER_MODES[mode]),
                 aa_text,
                 scene
@@ -317,8 +328,15 @@ fn main() {
                     "off"
                 },
                 if scene.fog.is_some() { "on" } else { "off" },
-                fps
-            ));
+                fps,
+                scene_ms,
+                post_ms,
+                present_ms
+            );
+            app.set_title(&status);
+            if show_timings {
+                eprintln!("{status}");
+            }
         }
     }
 }

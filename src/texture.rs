@@ -1,7 +1,7 @@
 //! Textures and sampling: packed RGB images with repeat/clamp/mirror wrapping.
 //! Made by AeroForger
 
-use crate::draw::rgb;
+use crate::draw::{rgb, unpack};
 use std::fmt;
 
 /// A problem while building a [`Texture`].
@@ -221,6 +221,13 @@ impl Texture {
         let c01 = self.texel(x0, y1);
         let c11 = self.texel(x1, y1);
 
+        // Flat regions (most of a checkerboard, for example) need no
+        // interpolation. Checking the packed texels keeps the result exact.
+        if c00 == c10 && c00 == c01 && c00 == c11 {
+            return unpack(c00);
+        }
+
+        let (c00, c10, c01, c11) = (unpack(c00), unpack(c10), unpack(c01), unpack(c11));
         let mut out = [0.0; 3];
         for (channel, out) in out.iter_mut().enumerate() {
             let top = c00[channel] + (c10[channel] - c00[channel]) * fx;
@@ -243,15 +250,18 @@ impl Texture {
     }
 
     #[inline]
-    fn texel(&self, x: i32, y: i32) -> [f32; 3] {
+    fn texel(&self, x: i32, y: i32) -> u32 {
         let x = self.wrap_index(x, self.width);
         let y = self.wrap_index(y, self.height);
-        crate::draw::unpack(self.pixels[y * self.width + x])
+        self.pixels[y * self.width + x]
     }
 
     #[inline]
     fn wrap_index(&self, index: i32, len: usize) -> usize {
         let len = len as i32;
+        if (0..len).contains(&index) {
+            return index as usize;
+        }
         match self.wrap {
             WrapMode::Repeat => index.rem_euclid(len) as usize,
             WrapMode::Clamp => index.clamp(0, len - 1) as usize,

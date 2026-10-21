@@ -21,6 +21,25 @@ use crate::camera::Camera;
 use crate::renderer::Renderer;
 use crate::scene::Scene;
 use minifb::{Key, Window, WindowOptions};
+use std::time::Instant;
+
+/// Time spent in the last [`AeroglWindow::draw`] call, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameTimings {
+    /// Scene drawing and anti-aliasing.
+    pub scene_ms: f32,
+    /// Post-processing.
+    pub post_ms: f32,
+    /// Sending the pixels to the window.
+    pub present_ms: f32,
+}
+
+impl FrameTimings {
+    /// Total time spent in the measured stages.
+    pub fn total_ms(&self) -> f32 {
+        self.scene_ms + self.post_ms + self.present_ms
+    }
+}
 
 /// A `minifb` window with a [`Renderer`] attached.
 ///
@@ -30,6 +49,7 @@ pub struct AeroglWindow {
     window: Window,
     renderer: Renderer,
     auto_resize: bool,
+    last_timings: FrameTimings,
 }
 
 impl AeroglWindow {
@@ -51,6 +71,7 @@ impl AeroglWindow {
             window,
             renderer: Renderer::new(width, height),
             auto_resize: true,
+            last_timings: FrameTimings::default(),
         })
     }
 
@@ -102,7 +123,21 @@ impl AeroglWindow {
         }
         let (width, height) = (self.renderer.width(), self.renderer.height());
         let pixels = self.renderer.render(scene, camera);
-        self.window.update_with_buffer(pixels, width, height)
+        let present_start = Instant::now();
+        let result = self.window.update_with_buffer(pixels, width, height);
+        let present_ms = present_start.elapsed().as_secs_f32() * 1000.0;
+        let render_timings = self.renderer.last_timings();
+        self.last_timings = FrameTimings {
+            scene_ms: render_timings.scene_ms,
+            post_ms: render_timings.post_ms,
+            present_ms,
+        };
+        result
+    }
+
+    /// Timings from the last [`AeroglWindow::draw`] call.
+    pub fn last_timings(&self) -> FrameTimings {
+        self.last_timings
     }
 
     /// Sets the window title. This is a platform call, so don't do it every

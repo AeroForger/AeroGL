@@ -246,13 +246,13 @@ pub fn draw_triangle_shaded(
             let idx = row + x as usize;
             // Slightly conservative epsilon avoids z-fighting on shared edges.
             if z < depth[idx] + 1e-6 {
-                let w = if iw.abs() > 1e-9 { iw } else { 1.0 };
-                let mut out = [r / w, g / w, b / w];
+                let inv_w = if iw.abs() > 1e-9 { 1.0 / iw } else { 1.0 };
+                let mut out = [r * inv_w, g * inv_w, b * inv_w];
                 if let Some(texture) = texture {
-                    let texel = texture.sample(u / w, v / w);
+                    let texel = texture.sample(u * inv_w, v * inv_w);
                     out = [out[0] * texel[0], out[1] * texel[1], out[2] * texel[2]];
                 }
-                let alpha = (alpha_w / w).clamp(0.0, 1.0);
+                let alpha = (alpha_w * inv_w).clamp(0.0, 1.0);
                 color[idx] = if alpha < 0.999 {
                     blend_over(color[idx], out, alpha)
                 } else {
